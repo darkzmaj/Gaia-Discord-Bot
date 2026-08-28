@@ -50,6 +50,8 @@ import { VerificationService } from "./services/verification-service.js";
 import { BackupService } from "./services/backup-service.js";
 import { logDiscordError, logger } from "./logger.js";
 import { CommandSynchronizer } from "./services/command-sync.js";
+import { AuditLogService } from "./services/audit-log-service.js";
+import { config } from "./config.js";
 
 const color = 0xd9a066;
 const reply = async (interaction: Interaction, content: string) => {
@@ -78,6 +80,7 @@ export class CookieBot {
   readonly verification: VerificationService;
   readonly backups: BackupService;
   readonly embedScheduler: EmbedScheduler;
+  readonly audit: AuditLogService;
   private readonly commandSync: CommandSynchronizer;
   private startedAt = Date.now();
   private readonly pendingEmbeds = new Map<
@@ -117,11 +120,12 @@ export class CookieBot {
     private readonly repo: CookieRepository,
     applicationId?: string,
   ) {
-    this.mutes = new MuteService(repo, () => this.client.guilds.cache.values());
+    this.audit = new AuditLogService(config.auditLogging, fetch, config.auditLoggingValidation);
+    this.mutes = new MuteService(repo, () => this.client.guilds.cache.values(), this.audit);
     this.rooms = new VoiceRoomService(repo);
-    this.verification = new VerificationService(repo);
-    this.backups = new BackupService(repo, this.client);
-    this.embedScheduler = new EmbedScheduler(repo, this.client);
+    this.verification = new VerificationService(repo, this.audit);
+    this.backups = new BackupService(repo, this.client, this.audit);
+    this.embedScheduler = new EmbedScheduler(repo, this.client, this.audit);
     this.commandSync = new CommandSynchronizer(repo, applicationId);
     this.adminUi = new AdminUi(
       repo,
@@ -130,6 +134,7 @@ export class CookieBot {
       this.verification,
       this.backups,
       () => this.compactUptime(Date.now() - this.startedAt),
+      this.audit,
     );
     this.installEvents();
   }
@@ -144,6 +149,7 @@ export class CookieBot {
           logger.error("Cookie startup failed", {
             error: error instanceof Error ? error.message : "unknown",
           });
+          this.audit.record({ title: "Cookie Startup Failed", category: "Bot", color: "danger", priority: "critical", reason: error instanceof Error ? error.message : "unknown" });
           this.client.destroy();
           process.exitCode = 1;
         }),
@@ -155,6 +161,7 @@ export class CookieBot {
           .ensureGuild(guild.id)
           .then(() => this.repo.markBackupSourceAvailable(guild.id))
           .then(() => this.commandSync.clearGuildOnJoin(guild as any))
+          .then(() => this.audit.record({ title: "Joined Guild", category: "Bot", color: "info", guild: { id: guild.id, name: guild.name } }))
           .catch((error) =>
             logger.error("guild initialization failed", {
               guildId: guild.id,
@@ -164,7 +171,8 @@ export class CookieBot {
     );
     this.client.on(
       "guildDelete",
-      (guild) =>
+      (guild) => {
+        this.audit.record({ title: "Left Guild", category: "Bot", color: "danger", priority: "critical", guild: { id: guild.id, name: guild.name } });
         void this.repo
           .markBackupSourceRemoved(guild.id)
           .then(() => this.repo.purgeGuild(guild.id))
@@ -176,7 +184,8 @@ export class CookieBot {
           })
           .catch(() =>
             logger.error("guild cleanup failed", { guildId: guild.id }),
-          ),
+          );
+      },
     );
     this.client.on(
       "guildMemberAdd",
@@ -247,9 +256,10 @@ export class CookieBot {
           }),
         ),
     );
-    this.client.on("error", (error) =>
-      logger.error("Discord client error", { error: error.name }),
-    );
+    this.client.on("error", (error) => {
+      logger.error("Discord client error", { error: error.name });
+      this.audit.record({ title: "Discord Client Error", category: "Bot", color: "danger", priority: "critical", reason: error.name });
+    });
   }
   private async onReady(client: Client): Promise<void> {
     this.startedAt = Date.now();
@@ -258,6 +268,13 @@ export class CookieBot {
       userId: client.user?.id,
       applicationId: client.application?.id,
     });
+    this.audit.record({ title: "Cookie Started", category: "Bot", color: "success", details: { Guilds: client.guilds.cache.size, Version: "1.0.0" } });
+    // Webhook destination validation is observability-only and never affects startup.
+    void this.audit.initialize().catch((error) =>
+      logger.warn("[logging] audit initialization failed safely", {
+        error: error instanceof Error ? error.name : "unknown",
+      }),
+    );
     await this.commandSync.synchronize(this.client);
     this.mutes.start();
     await this.repo.interruptRunningRestores();
@@ -402,7 +419,7 @@ export class CookieBot {
       );
       if (result.error || !result.changed)
         return void reply(i, result.error ?? "That member is not muted.");
-      return void i.reply({
+      return void await i.reply({
         embeds: [
           new EmbedBuilder()
             .setColor(0x57f287)
@@ -464,10 +481,10 @@ export class CookieBot {
     if (!administrator || !i.guild) return;
     await i.deferReply({ flags: MessageFlags.Ephemeral });
     const user = i.options.getUser("user", true);
-    const result = await this.verification.unverify(i.guild, user.id);
-    if (result.error) return void i.editReply(result.error);
+    const result = await this.verification.unverify(i.guild, user.id, administrator);
+    if (result.error) return void await i.editReply(result.error);
     if (!result.changed)
-      return void i.editReply({
+      return void await i.editReply({
         embeds: [
           new EmbedBuilder()
             .setColor(0xfee75c)
@@ -524,7 +541,7 @@ export class CookieBot {
             i.user.id,
           ),
         );
-        return void i.reply({
+        return void await i.reply({
           content: `🟢 Stored attachment **${upload.name}** on global template **${template.name}**. Use \`attachment://${upload.name}\` in embed image or thumbnail URLs.`,
           flags: MessageFlags.Ephemeral,
         });
@@ -539,7 +556,7 @@ export class CookieBot {
       const template = await this.repo.embed(requestedTemplate);
       if (!template) return void reply(i, "That global embed does not exist.");
       const attachments = await this.repo.attachments(template.template_id);
-      return void i.reply({
+      return void await i.reply({
         content: attachments.length
           ? `**${template.name} attachments**\n${attachments.map((item) => `• ${item.filename} — ${(item.size_bytes / 1024).toFixed(1)} KB`).join("\n")}\n\nUpload a same-named file to replace it.`
           : `**${template.name}** has no stored attachments. Upload with the attachment option.`,
@@ -642,7 +659,7 @@ export class CookieBot {
           "One or more selected roles are unavailable or managed by an integration.",
         );
       session.mention = { ...(session.mention ?? noMention), roles };
-      return void i.update(
+      return void await i.update(
         this.mentionSettings(mode, token, session.mention, i.guild),
       );
     }
@@ -663,7 +680,7 @@ export class CookieBot {
         everyone: mass === "everyone" ? !current.everyone : false,
         here: mass === "here" ? !current.here : false,
       };
-      return void i.update(
+      return void await i.update(
         this.mentionSettings(mode, token, session.mention, i.guild),
       );
     }
@@ -678,7 +695,7 @@ export class CookieBot {
       )
         return void reply(i, "That mention session expired.");
       session.mention = { ...noMention };
-      return void i.update(
+      return void await i.update(
         this.mentionSettings(mode, token, session.mention, i.guild),
       );
     }
@@ -716,7 +733,7 @@ export class CookieBot {
         mode === "manual"
           ? `embedui:manualconfirm:${token}`
           : `embedui:scheduleconfirm:${token}`;
-      return void i.update({
+      return void await i.update({
         embeds: [
           new EmbedBuilder()
             .setColor(mass ? 0xed4245 : 0x5865f2)
@@ -746,7 +763,7 @@ export class CookieBot {
         token = pieces[3],
         session = mentionSession(mode, token);
       if (!session) return void reply(i, "That mention session expired.");
-      return void i.update(
+      return void await i.update(
         this.mentionSettings(
           mode,
           token,
@@ -760,7 +777,7 @@ export class CookieBot {
         token = pieces[3];
       if (mode === "manual") this.embedSessions.delete(token);
       else this.scheduleSessions.delete(token);
-      return void i.update({
+      return void await i.update({
         embeds: [
           new EmbedBuilder()
             .setColor(0xfee75c)
@@ -780,7 +797,7 @@ export class CookieBot {
           `Attachment ${filename} is still referenced by this template. Edit the JSON first or replace the attachment.`,
         );
       await this.repo.deleteAttachment(template.template_id, filename);
-      return void i.update({
+      return void await i.update({
         content: `Removed attachment **${filename}** from **${template.name}**.`,
         components: [],
       });
@@ -793,7 +810,7 @@ export class CookieBot {
         schedule.status !== "scheduled"
       )
         return void reply(i, "That pending schedule is unavailable.");
-      return void i.update({
+      return void await i.update({
         content: `Cancel scheduled send?\n\nTemplate: **${schedule.template_name_snapshot}**\nChannel: <#${schedule.channel_id}>\nTime: <t:${Math.floor(new Date(schedule.scheduled_for_utc).getTime() / 1000)}:F>`,
         components: [
           new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -810,12 +827,15 @@ export class CookieBot {
       });
     }
     if (i.isButton() && action === "cancelconfirm") {
+      const schedule = await this.repo.schedule(tokenOrGuild);
       const cancelled = await this.repo.cancelSchedule(
         tokenOrGuild,
         i.guild.id,
         i.user.id,
       );
-      return void i.update({
+      if (cancelled && schedule)
+        this.audit.record({ title: "Embed Schedule Cancelled", category: "Embeds", color: "warning", guild: { id: i.guild.id, name: i.guild.name }, channel: { id: schedule.channel_id }, actor: { id: i.user.id, name: i.user.tag }, details: { Template: schedule.template_name_snapshot, Schedule: schedule.id } });
+      return void await i.update({
         content: cancelled
           ? "Schedule cancelled. History is retained."
           : "Schedule was already changed or is unavailable.",
@@ -823,9 +843,9 @@ export class CookieBot {
       });
     }
     if (i.isButton() && action === "cancelback")
-      return void i.update({ content: "Schedule kept.", components: [] });
+      return void await i.update({ content: "Schedule kept.", components: [] });
     if (i.isButton() && action === "schedule")
-      return void i.reply({
+      return void await i.reply({
         content:
           "Scheduled sends use the latest saved template at delivery time.",
         components: [
@@ -857,7 +877,7 @@ export class CookieBot {
           name: `${schedule.template_name_snapshot} — ${schedule.status}`,
           value: `Channel: <#${schedule.channel_id}>\nDelivery: <t:${Math.floor(new Date(schedule.scheduled_for_utc).getTime() / 1000)}:F>\nMentions: ${mentionLabel(parseMention(schedule.mention_json))}${schedule.mention_outcome ? `\nOutcome: ${schedule.mention_outcome}` : ""}`,
         }));
-      return void i.reply({
+      return void await i.reply({
         embeds: [
           new EmbedBuilder()
             .setColor(action === "upcoming" ? 0xfee75c : 0x5865f2)
@@ -897,13 +917,13 @@ export class CookieBot {
     if (i.isButton() && action === "schedulecreate") {
       const names = await this.repo.embeds(0, 25);
       if (!names.length)
-        return void i.reply({
+        return void await i.reply({
           content: "Save a global embed before scheduling it.",
           flags: MessageFlags.Ephemeral,
         });
       const token = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
       this.embedSessions.set(token, { guildId: i.guild.id, userId: i.user.id });
-      return void i.reply({
+      return void await i.reply({
         content: "Choose a template to schedule.",
         components: [
           new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
@@ -919,13 +939,13 @@ export class CookieBot {
     if (i.isButton() && ["edit", "send", "json"].includes(action)) {
       const names = await this.repo.embeds(0, 25);
       if (!names.length)
-        return void i.reply({
+        return void await i.reply({
           content: "No global embeds have been saved.",
           flags: MessageFlags.Ephemeral,
         });
       const token = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
       this.embedSessions.set(token, { guildId: i.guild.id, userId: i.user.id });
-      return void i.reply({
+      return void await i.reply({
         content: `Select an embed to ${action}.`,
         components: [
           new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
@@ -940,7 +960,7 @@ export class CookieBot {
     }
     if (i.isButton() && action === "list") {
       const names = await this.repo.embeds(0, 25);
-      return void i.reply({
+      return void await i.reply({
         content: names.length
           ? `**Global Embeds**\n${names.map((name) => `• ${name}`).join("\n")}`
           : "No global embeds have been saved.",
@@ -950,7 +970,7 @@ export class CookieBot {
     if (i.isButton() && action === "attachments") {
       const names = await this.repo.embeds(0, 25);
       if (!names.length) return void reply(i, "Create an embed before adding attachments.");
-      return void i.reply({
+      return void await i.reply({
         content: "Select the saved embed whose attachments you want to manage.",
         components: [
           new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
@@ -967,7 +987,7 @@ export class CookieBot {
       const template = await this.repo.embed(i.values[0]);
       if (!template) return void reply(i, "That global embed no longer exists.");
       const attachments = await this.repo.attachments(template.template_id);
-      return void i.update({
+      return void await i.update({
         content: attachments.length
           ? `**${template.name} attachments**\n${attachments.map((item) => `• ${item.filename} — ${(item.size_bytes / 1024).toFixed(1)} KB`).join("\n")}`
           : `**${template.name}** has no stored attachments.`,
@@ -998,29 +1018,9 @@ export class CookieBot {
             : []),
         ],
       });
-      /*
-      return void i.showModal({
-        customId: `embedui:attachmentupload:${template.template_id}`,
-        title: `Upload attachment: ${template.name}`.slice(0, 45),
-        components: [
-          {
-            type: ComponentType.Label,
-            label: "Attachment",
-            description: "Uploading a same-named file replaces it.",
-            component: {
-              type: ComponentType.FileUpload,
-              customId: "attachment",
-              minValues: 1,
-              maxValues: 1,
-              required: true,
-            },
-          },
-        ],
-      } as any);
-      */
     }
     if (i.isButton() && action === "attachmentupload")
-      return void i.showModal({
+      return void await i.showModal({
         customId: `embedui:attachmentupload:${tokenOrGuild}`,
         title: "Upload embed attachment",
         components: [
@@ -1065,7 +1065,7 @@ export class CookieBot {
             i.user.id,
           ),
         );
-        return void i.reply({
+        return void await i.reply({
           content: `Stored attachment **${upload.name}** on **${template.name}**. Use \`attachment://${upload.name}\` in embed image or thumbnail URLs.`,
           flags: MessageFlags.Ephemeral,
         });
@@ -1077,7 +1077,7 @@ export class CookieBot {
       }
     }
     if (i.isButton() && action === "create")
-      return void i.showModal(
+      return void await i.showModal(
         new ModalBuilder()
           .setCustomId(`embedui:name:create:${i.guild.id}`)
           .setTitle("Create Global Embed")
@@ -1097,7 +1097,7 @@ export class CookieBot {
       if (!name) return void reply(i, "Provide an embed name.");
       if (await this.repo.embed(name))
         return void reply(i, "That global embed already exists.");
-      return void i.reply({
+      return void await i.reply({
         embeds: [
           new EmbedBuilder()
             .setColor(color)
@@ -1143,7 +1143,7 @@ export class CookieBot {
           name: stored.name,
           templateId: stored.template_id,
         });
-        return void i.update({
+        return void await i.update({
           content: `Select a destination for scheduled **${name}**.`,
           components: [
             new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(
@@ -1159,7 +1159,7 @@ export class CookieBot {
         });
       }
       if (mode === "edit")
-        return void i.update({
+        return void await i.update({
           content: `Editing global embed **${name}**.`,
           components: [
             new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -1186,12 +1186,12 @@ export class CookieBot {
                 },
               ],
             });
-          return void i.update({
+          return void await i.update({
             content: "I sent the exact JSON to your DMs.",
             components: [],
           });
         } catch {
-          return void i.update({
+          return void await i.update({
             content:
               "Cookie could not DM you. Enable DMs from this server and try again.",
             components: [],
@@ -1204,7 +1204,7 @@ export class CookieBot {
         userId: i.user.id,
         name,
       });
-      return void i.update({
+      return void await i.update({
         content: `Select a destination for **${name}**.`,
         components: [
           new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(
@@ -1238,7 +1238,7 @@ export class CookieBot {
           "That schedule session expired or the channel is unavailable.",
         );
       session.channelId = channel.id;
-      return void i.showModal(
+      return void await i.showModal(
         new ModalBuilder()
           .setCustomId(`embedui:time:${token}`)
           .setTitle("Schedule delivery")
@@ -1271,7 +1271,7 @@ export class CookieBot {
         session.utc = parsed.utc.toISOString();
         session.display = parsed.display;
         session.mention = noMention;
-        return void i.reply({
+        return void await i.reply({
           ...this.mentionSettings(
             "schedule",
             tokenOrGuild,
@@ -1289,7 +1289,7 @@ export class CookieBot {
     }
     if (i.isButton() && action === "schedulecancel") {
       this.scheduleSessions.delete(tokenOrGuild);
-      return void i.update({ content: "Schedule cancelled.", components: [] });
+      return void await i.update({ content: "Schedule cancelled.", components: [] });
     }
     if (i.isButton() && action === "scheduleconfirm") {
       const session = this.scheduleSessions.get(tokenOrGuild);
@@ -1328,8 +1328,9 @@ export class CookieBot {
         template_name_snapshot: session.name,
         mention_json: JSON.stringify(mention),
       });
+      this.audit.record({ title: "Embed Scheduled", category: "Embeds", color: "info", guild: { id: i.guild.id, name: i.guild.name }, channel: { id: session.channelId, name: channel.name }, actor: { id: i.user.id, name: i.user.tag }, details: { Template: session.name, Delivery: session.display ?? session.utc } });
       this.scheduleSessions.delete(tokenOrGuild);
-      return void i.update({
+      return void await i.update({
         embeds: [
           new EmbedBuilder()
             .setColor(0x57f287)
@@ -1379,8 +1380,9 @@ export class CookieBot {
         channel.id,
         message.id,
       );
+      this.audit.record({ title: "Embed Manually Sent", category: "Embeds", color: "success", guild: { id: i.guild.id, name: i.guild.name }, channel: { id: channel.id, name: channel.name }, actor: { id: i.user.id, name: i.user.tag }, details: { Template: stored.name } });
       this.embedSessions.delete(tokenOrGuild);
-      return void i.update({
+      return void await i.update({
         embeds: [
           new EmbedBuilder()
             .setColor(0x57f287)
@@ -1418,7 +1420,7 @@ export class CookieBot {
         );
       session.channelId = channel.id;
       session.mention = noMention;
-      return void i.update(
+      return void await i.update(
         this.mentionSettings("manual", token, session.mention, i.guild),
       );
     }
@@ -1443,7 +1445,7 @@ export class CookieBot {
               .setMaxLength(4000),
           ),
         );
-        return void i.showModal(
+        return void await i.showModal(
           new ModalBuilder()
             .setCustomId(`embedmodal:large-${mode}:${encodeURIComponent(name)}`)
             .setTitle("Large Embed JSON")
@@ -1458,7 +1460,7 @@ export class CookieBot {
         .setMaxLength(4000);
       if (existing?.payload_json.length && existing.payload_json.length <= 4000)
         input.setValue(existing.payload_json);
-      return void i.showModal(
+      return void await i.showModal(
         new ModalBuilder()
           .setCustomId(`embedmodal:${mode}:${encodeURIComponent(name)}`)
           .setTitle("Enter Embed JSON")
@@ -1482,7 +1484,7 @@ export class CookieBot {
         pending.replace,
       );
       if (!saved)
-        return void i.update({
+        return void await i.update({
           content: "That embed name already exists.",
           embeds: [],
           components: [],
@@ -1491,7 +1493,8 @@ export class CookieBot {
       const tracked = stored
         ? await this.repo.sentEmbeds(stored.template_id, i.guild.id)
         : [];
-      return void i.update({
+      this.audit.record({ title: pending.replace ? "Global Embed Edited" : "Global Embed Created", category: "Embeds", color: "success", guild: { id: i.guild.id, name: i.guild.name }, actor: { id: i.user.id, name: i.user.tag }, details: { Template: pending.name } });
+      return void await i.update({
         content: `Global embed **${pending.name}** saved.`,
         embeds: [],
         components: tracked.length
@@ -1572,13 +1575,13 @@ export class CookieBot {
         }
       }
       this.pendingEmbeds.delete(mode);
-      return void i.update({
+      return void await i.update({
         content: `🟢 Updated ${updated} sent embed${updated === 1 ? "" : "s"}.${stale ? `\n🟡 ${stale} tracked message${stale === 1 ? " was" : "s were"} unavailable.` : ""}`,
         components: [],
       });
     }
     if (action === "cancel")
-      return void i.update({
+      return void await i.update({
         content: "Embed changes cancelled.",
         embeds: [],
         components: [],
@@ -1766,17 +1769,19 @@ export class CookieBot {
         userId: member.id,
         roleId,
       });
+      this.audit.record({ title: "AutoRole Assignment Failed", category: "AutoRole", color: "danger", priority: "critical", guild: { id: member.guild.id, name: member.guild.name }, target: { id: member.id, name: member.user.tag }, details: { Role: roleId, Reason: "Configured role is unavailable or above Cookie." } });
       return;
     }
     await member.roles
       .add(role, "Cookie autorole")
-      .catch(() =>
+      .catch(() => {
         logger.warn("autorole assignment failed", {
           guildId: member.guild.id,
           userId: member.id,
           roleId,
-        }),
-      );
+        });
+        this.audit.record({ title: "AutoRole Assignment Failed", category: "AutoRole", color: "danger", priority: "critical", guild: { id: member.guild.id, name: member.guild.name }, target: { id: member.id, name: member.user.tag }, details: { Role: role.name } });
+      });
   }
   private async onChannelDelete(
     guild: Guild,

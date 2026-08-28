@@ -30,6 +30,7 @@ import {
   type BackupService,
 } from "./backup-service.js";
 import { logDiscordError } from "../logger.js";
+import type { AuditLogService } from "./audit-log-service.js";
 
 const color = 0xd9a066;
 type DeploymentSession = { guildId: string; userId: string; channelId: string };
@@ -43,7 +44,12 @@ export class AdminUi {
     private readonly verification: VerificationService,
     private readonly backups: BackupService,
     private readonly uptime: () => string,
+    private readonly audit?: AuditLogService,
   ) {}
+
+  private auditConfiguration(i: any, title: string, details?: Record<string, string | number | boolean>): void {
+    this.audit?.record({ title, category: "Admin Configuration", color: "warning", guild: { id: i.guild.id, name: i.guild.name }, actor: { id: i.user.id, name: i.user.tag }, details });
+  }
 
   async open(i: any) {
     if (!i.guild || !(await this.admin(i))) return;
@@ -57,11 +63,11 @@ export class AdminUi {
     if (!i.guild || !(await this.admin(i))) return;
     const [, kind, action, guildId] = i.customId.split(":");
     if (guildId !== i.guild.id)
-      return void i.reply({
+      return void await i.reply({
         content: "That control belongs to a different server.",
         flags: MessageFlags.Ephemeral,
       });
-    if (kind === "nav") return void i.update(await this.view(i.guild, action));
+    if (kind === "nav") return void await i.update(await this.view(i.guild, action));
     if (kind === "verify") {
       const config = await this.repo.verification(i.guild.id);
       const result = await this.verification.setEnabled(
@@ -69,7 +75,8 @@ export class AdminUi {
         !config.enabled,
         this.rooms,
       );
-      return void i.update({
+      if (result.changed) this.auditConfiguration(i, `Verification ${!config.enabled ? "Enabled" : "Disabled"}`);
+      return void await i.update({
         ...(await this.view(i.guild, "verification")),
         content: result.error,
       });
@@ -80,10 +87,11 @@ export class AdminUi {
         await this.repo.updateBackupSettings(i.guild.id, {
           automatic_enabled: settings.automatic_enabled ? 0 : 1,
         });
-        return void i.update(await this.view(i.guild, "backups"));
+        this.auditConfiguration(i, `Automatic Backups ${settings.automatic_enabled ? "Disabled" : "Enabled"}`);
+        return void await i.update(await this.view(i.guild, "backups"));
       }
       if (action === "create")
-        return void i.update({
+        return void await i.update({
           content:
             "Create a configuration backup for this guild? Existing backups are retained until the new snapshot is stored successfully.",
           embeds: [],
@@ -98,11 +106,11 @@ export class AdminUi {
           ],
         });
       if (action === "view")
-        return void i.update(
+        return void await i.update(
           await this.backupPicker(i.guild, "view", i.user.id),
         );
       if (action === "restore")
-        return void i.update(
+        return void await i.update(
           await this.backupPicker(i.guild, "restore", i.user.id),
         );
     }
@@ -113,7 +121,7 @@ export class AdminUi {
         backup = await this.backups.create(i.guild, i.user.id, "manual");
       } catch (error) {
         if (error instanceof BackupAlreadyRunningError)
-          return void i.editReply({
+          return void await i.editReply({
             embeds: [
               new EmbedBuilder()
                 .setColor(0xfee75c)
@@ -125,7 +133,7 @@ export class AdminUi {
             components: [],
           });
         if (error instanceof MemberSynchronizationError && error.rateLimited)
-          return void i.editReply({
+          return void await i.editReply({
             embeds: [
               new EmbedBuilder()
                 .setColor(0xed4245)
@@ -138,14 +146,14 @@ export class AdminUi {
           });
         throw error;
       }
-      return void i.editReply({
+      return void await i.editReply({
         ...(await this.view(i.guild, "backups")),
         content: `🟢 Backup Created\n\n${backup.source_guild_name} • ${new Date(backup.created_at).toLocaleString("en-GB", { timeZone: "Europe/Ljubljana" })}\nRoles: ${backup.role_count} • Channels: ${backup.channel_count} • Members: ${backup.member_count}`,
       });
     }
     if (kind === "backupdelete" && action.startsWith("confirm-")) {
       const backupId = action.slice(8);
-      return void i.update({
+      return void await i.update({
         content: "Delete this backup permanently? This cannot be undone.",
         embeds: [],
         components: [
@@ -164,7 +172,7 @@ export class AdminUi {
     if (kind === "backupdelete" && action.startsWith("delete-")) {
       const backupId = action.slice(7);
       const deleted = await this.backups.delete(backupId, i.user.id);
-      return void i.update({
+      return void await i.update({
         ...(await this.view(i.guild, "backups")),
         content: deleted
           ? "🟢 Backup deleted."
@@ -266,37 +274,38 @@ export class AdminUi {
       const config = await this.repo.verification(i.guild.id);
       await this.repo.updateVerification(i.guild.id, { role_id: null });
       await this.rooms.reconcileGuildAccess(i.guild, config.role_id);
-      return void i.update({
+      return void await i.update({
         ...(await this.view(i.guild, "verification")),
         content:
           "🟡 Verification role removed. Verification will not restrict room access until a valid role is configured.",
       });
     }
     if (kind === "verifymessage" && action === "edit")
-      return void i.showModal(await this.messageModal(i.guild));
+      return void await i.showModal(await this.messageModal(i.guild));
     if (kind === "verifycolor" && action === "show")
-      return void i.update(this.colorPicker(i.guild.id));
+      return void await i.update(this.colorPicker(i.guild.id));
     if (kind === "verifycolor" && action === "custom")
-      return void i.showModal(this.colorModal(i.guild.id));
+      return void await i.showModal(this.colorModal(i.guild.id));
     if (kind === "verifypreview") {
       const config = await this.repo.verification(i.guild.id);
-      return void i.reply({
+      return void await i.reply({
         content: "Preview — this button is disabled and cannot verify anyone.",
         ...this.verification.panel(config, true),
         flags: MessageFlags.Ephemeral,
       });
     }
     if (kind === "verifysend" && action === "choose")
-      return void i.update(this.channelPicker(i.guild.id));
-    if (kind === "verifydeploy") return void this.deploy(i, action);
+      return void await i.update(this.channelPicker(i.guild.id));
+    if (kind === "verifydeploy") return await this.deploy(i, action);
     if (kind === "verifyupdate" && action === "edit")
-      return void this.updateDeployed(i);
+      return await this.updateDeployed(i);
     if (kind === "toggle") {
       const key = action as
         | "autorole_enabled"
         | "voice_rooms_enabled"
         | "moderation_enabled";
       const enabled = await this.repo.toggle(i.guild.id, key);
+      this.auditConfiguration(i, `${key === "autorole_enabled" ? "AutoRole" : key === "voice_rooms_enabled" ? "Voice Rooms" : "Moderation"} ${enabled ? "Enabled" : "Disabled"}`);
       let notice: string | undefined;
       if (
         key === "autorole_enabled" &&
@@ -309,7 +318,7 @@ export class AdminUi {
       if (key === "voice_rooms_enabled" && !enabled)
         await this.rooms.cleanupGuild(i.guild);
       await this.rooms.refreshGuildConfig(i.guild.id);
-      return void i.update({
+      return void await i.update({
         ...(await this.view(i.guild, this.sectionFor(key))),
         content: notice,
       });
@@ -321,13 +330,16 @@ export class AdminUi {
           action === "user" ? "user_role_id" : "bot_role_id",
           null,
         );
+      if (action === "user" || action === "bot") this.auditConfiguration(i, `${action === "user" ? "User" : "Bot"} AutoRole Changed`, { After: "None" });
       if (action === "join") {
         await this.repo.setJoinChannel(i.guild.id, null);
         await this.rooms.refreshGuildConfig(i.guild.id);
+        this.auditConfiguration(i, "Join Channel Changed", { After: "None" });
       }
       if (action === "ticket")
         await this.mutes.configureTicketCategory(i.guild, null);
-      return void i.update(
+      if (action === "ticket") this.auditConfiguration(i, "Ticket Exception Changed", { After: "None" });
+      return void await i.update(
         await this.view(
           i.guild,
           action === "join"
@@ -339,14 +351,14 @@ export class AdminUi {
       );
     }
     if (kind === "pick")
-      return void i.update(await this.picker(i.guild, action));
+      return void await i.update(await this.picker(i.guild, action));
   }
 
   async handleSelect(i: any) {
     if (!i.guild || !(await this.admin(i))) return;
     const [, kind, action, guildId] = i.customId.split(":");
     if (guildId !== i.guild.id)
-      return void i.reply({
+      return void await i.reply({
         content: "That control belongs to a different server.",
         flags: MessageFlags.Ephemeral,
       });
@@ -355,7 +367,7 @@ export class AdminUi {
       try {
         const preview = await this.backups.preview(id, i.guild, i.user.id);
         if (action === "view")
-          return void i.update({
+          return void await i.update({
             content: "",
             embeds: [
               new EmbedBuilder()
@@ -377,7 +389,7 @@ export class AdminUi {
               ),
             ],
           });
-        return void i.update({
+        return void await i.update({
           content: "",
           embeds: [
             new EmbedBuilder()
@@ -400,7 +412,7 @@ export class AdminUi {
           ],
         });
       } catch (error) {
-        return void i.reply({
+        return void await i.reply({
           content:
             error instanceof Error ? error.message : "Backup is unavailable.",
           flags: MessageFlags.Ephemeral,
@@ -410,7 +422,7 @@ export class AdminUi {
     if (kind === "role") {
       const role = i.guild.roles.cache.get(id);
       if (!role || !this.verification.assignable(i.guild, role))
-        return void i.reply({
+        return void await i.reply({
           content:
             "Cookie cannot use that role. Check Manage Roles, role hierarchy, and that it is not an integration role.",
           flags: MessageFlags.Ephemeral,
@@ -419,18 +431,20 @@ export class AdminUi {
         const old = await this.repo.verification(i.guild.id);
         await this.repo.updateVerification(i.guild.id, { role_id: id });
         await this.rooms.reconcileGuildAccess(i.guild, old.role_id);
+        this.auditConfiguration(i, "Verification Role Changed", { Before: old.role_id ?? "None", After: id });
       } else {
         await this.repo.setAutorole(
           i.guild.id,
           action === "user" ? "user_role_id" : "bot_role_id",
           id,
         );
+        this.auditConfiguration(i, `${action === "user" ? "User" : "Bot"} AutoRole Changed`, { After: id });
         if (
           action === "user" &&
           (await this.repo.settings(i.guild.id)).autorole_enabled &&
           (await this.verification.disableForUserAutorole(i.guild, this.rooms))
         )
-          return void i.update({
+          return void await i.update({
             ...(await this.view(i.guild, "autorole")),
             content:
               "🟡 Verification Disabled\n\nVerification was automatically disabled because User AutoRole is enabled. User AutoRole and Verification cannot be enabled at the same time.",
@@ -438,10 +452,10 @@ export class AdminUi {
       }
     }
     if (kind === "color") {
-      if (id === "custom") return void i.showModal(this.colorModal(i.guild.id));
+      if (id === "custom") return void await i.showModal(this.colorModal(i.guild.id));
       const parsed = normalizeVerificationColor(id);
       if (parsed === null)
-        return void i.reply({
+        return void await i.reply({
           content: "That color is invalid.",
           flags: MessageFlags.Ephemeral,
         });
@@ -456,7 +470,7 @@ export class AdminUi {
         channel,
       );
       if (error)
-        return void i.reply({
+        return void await i.reply({
           content: `🔴 Cannot deploy verification message: ${error}`,
           flags: MessageFlags.Ephemeral,
         });
@@ -466,7 +480,7 @@ export class AdminUi {
         userId: i.user.id,
         channelId: id,
       });
-      return void i.update({
+      return void await i.update({
         content: `Ready to send the verification message to <#${id}>. Review the preview, then confirm.`,
         ...this.verification.panel(config, true),
         components: [
@@ -489,12 +503,14 @@ export class AdminUi {
     if (kind === "staff") {
       if (action === "add") await this.repo.addStaff(i.guild.id, id, i.user.id);
       else await this.repo.removeStaff(i.guild.id, id);
+      this.auditConfiguration(i, action === "add" ? "Staff Added" : "Staff Removed", { Member: id });
     }
     if (kind === "channel") {
       if (action === "join") {
         await this.repo.setJoinChannel(i.guild.id, id);
         await this.rooms.refreshGuildConfig(i.guild.id);
-      } else await this.mutes.configureTicketCategory(i.guild, id);
+        this.auditConfiguration(i, "Join Channel Changed", { After: id });
+      } else { await this.mutes.configureTicketCategory(i.guild, id); this.auditConfiguration(i, "Ticket Exception Changed", { After: id }); }
     }
     await i.update(
       await this.view(
@@ -530,7 +546,7 @@ export class AdminUi {
         !button ||
         button.length > 80
       )
-        return void i.reply({
+        return void await i.reply({
           content:
             "Use a title up to 256 characters, description up to 4096 characters, and button text up to 80 characters.",
           flags: MessageFlags.Ephemeral,
@@ -540,7 +556,7 @@ export class AdminUi {
         description,
         button_text: button,
       });
-      return void i.update({
+      return void await i.update({
         content: "🟢 Verification message configuration saved.",
         ...(await this.view(i.guild, "verification")),
       });
@@ -550,13 +566,13 @@ export class AdminUi {
         i.fields.getTextInputValue("color"),
       );
       if (parsed === null)
-        return void i.reply({
+        return void await i.reply({
           content:
             "Enter a six-digit hexadecimal color, for example `#57F287`.",
           flags: MessageFlags.Ephemeral,
         });
       await this.repo.updateVerification(i.guild.id, { color: parsed });
-      return void i.update({
+      return void await i.update({
         content: "🟢 Verification color saved.",
         ...(await this.view(i.guild, "verification")),
       });
@@ -570,7 +586,7 @@ export class AdminUi {
       session.guildId !== i.guild.id ||
       session.userId !== i.user.id
     )
-      return void i.reply({
+      return void await i.reply({
         content:
           "That deployment confirmation expired. Start again from Verification.",
         flags: MessageFlags.Ephemeral,
@@ -585,7 +601,7 @@ export class AdminUi {
       channel,
     );
     if (error || !channel || !channel.isTextBased() || !("send" in channel))
-      return void i.reply({
+      return void await i.reply({
         content: `🔴 Cannot deploy verification message: ${error ?? "Choose a text channel."}`,
         flags: MessageFlags.Ephemeral,
       });
@@ -593,7 +609,7 @@ export class AdminUi {
       .send(this.verification.panel(config))
       .catch(() => null);
     if (!message)
-      return void i.reply({
+      return void await i.reply({
         content:
           "Cookie could not send the verification message. Check its channel permissions.",
         flags: MessageFlags.Ephemeral,
@@ -602,6 +618,7 @@ export class AdminUi {
       channel_id: channel.id,
       message_id: message.id,
     });
+    this.auditConfiguration(i, "Verification Message Deployed", { Channel: channel.id, Message: message.id });
     this.deployments.delete(token);
     await i.update({
       ...(await this.view(i.guild, "verification")),
@@ -613,7 +630,7 @@ export class AdminUi {
     const config = await this.repo.verification(i.guild.id);
     const tracked = await this.deployedMessage(i.guild, config);
     if (!tracked)
-      return void i.update({
+      return void await i.update({
         ...(await this.view(i.guild, "verification")),
         content:
           "🟡 The tracked verification message no longer exists. Its deployment record was cleared.",
@@ -624,7 +641,7 @@ export class AdminUi {
       tracked.channel,
     );
     if (error)
-      return void i.reply({
+      return void await i.reply({
         content: `🔴 Cannot update verification message: ${error}`,
         flags: MessageFlags.Ephemeral,
       });
@@ -646,7 +663,7 @@ export class AdminUi {
         channel_id: null,
         message_id: null,
       });
-      return void i.update({
+      return void await i.update({
         ...(await this.view(i.guild, "verification")),
         content:
           "🟡 The tracked verification message no longer exists. Its deployment record was cleared.",

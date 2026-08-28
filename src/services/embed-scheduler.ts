@@ -2,6 +2,7 @@ import type { Client } from 'discord.js';
 import type { CookieRepository, ScheduledEmbedSend } from '../db/repositories.js';
 import { logger } from '../logger.js';
 import { parseMention, renderTemplate, resolveMention, withDeliveryMention } from './embed-renderer.js';
+import type { AuditLogService } from './audit-log-service.js';
 
 export const SCHEDULE_POLL_MS = 30_000;
 export const MISSED_SCHEDULE_GRACE_MS = 24 * 60 * 60_000;
@@ -11,7 +12,7 @@ const reason = (error: unknown) => String((error as any)?.message ?? 'unknown de
 export class EmbedScheduler {
   private timer?: NodeJS.Timeout;
   private stopping = false;
-  constructor(private readonly repo: CookieRepository, private readonly client: Client) {}
+  constructor(private readonly repo: CookieRepository, private readonly client: Client, private readonly audit?: AuditLogService) {}
   async start(): Promise<void> { this.stopping = false; const stale = await this.repo.reconcileStaleScheduleProcessing(new Date().toISOString()); logger.info('[scheduler] started', { stale }); await this.tick(); this.timer = setInterval(() => void this.tick().catch((error) => logger.error('[scheduler] tick failed', { error: error instanceof Error ? error.name : 'unknown' })), SCHEDULE_POLL_MS); }
   stop(): void { this.stopping = true; if (this.timer) clearInterval(this.timer); this.timer = undefined; }
   async tick(now = new Date()): Promise<void> { if (this.stopping) return; for (;;) { const schedule = await this.repo.claimDueSchedule(now.toISOString()); if (!schedule || this.stopping) return; await this.deliver(schedule, now); } }
@@ -27,6 +28,7 @@ export class EmbedScheduler {
       await this.repo.trackSentEmbed(template.template_id, guild.id, channel.id, message.id);
       await this.repo.updateSchedule(schedule.id, 'scheduler', { status: 'sent', sent_at: new Date().toISOString(), sent_message_id: message.id, failure_code: null, failure_reason: null, mention_outcome: resolved.warning ?? `Delivered: ${JSON.stringify(resolved.mention)}` });
       logger.info('[scheduler] sent', { id: schedule.id, guild: guild.id, channel: channel.id });
-    } catch (error) { await this.repo.updateSchedule(schedule.id, 'scheduler', { status: 'failed', failure_code: String((error as any)?.code ?? 'DELIVERY_FAILED').slice(0, 60), failure_reason: reason(error) }); logger.warn('[scheduler] failed', { id: schedule.id, code: String((error as any)?.code ?? 'DELIVERY_FAILED') }); }
+      this.audit?.record({ title: 'Scheduled Embed Delivered', category: 'Embeds', color: 'success', guild: { id: guild.id, name: guild.name }, channel: { id: channel.id, name: channel.name }, details: { Template: schedule.template_name_snapshot, Schedule: schedule.id } });
+    } catch (error) { await this.repo.updateSchedule(schedule.id, 'scheduler', { status: 'failed', failure_code: String((error as any)?.code ?? 'DELIVERY_FAILED').slice(0, 60), failure_reason: reason(error) }); logger.warn('[scheduler] failed', { id: schedule.id, code: String((error as any)?.code ?? 'DELIVERY_FAILED') }); this.audit?.record({ title: 'Scheduled Embed Failed', category: 'Embeds', color: 'danger', priority: 'critical', guild: { id: schedule.guild_id }, channel: { id: schedule.channel_id }, reason: reason(error), details: { Template: schedule.template_name_snapshot, Schedule: schedule.id } }); }
   }
 }

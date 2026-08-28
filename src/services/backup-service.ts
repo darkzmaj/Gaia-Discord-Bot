@@ -15,6 +15,7 @@ import type {
 import { KeyedLock } from "./locks.js";
 import { logDiscordError, logger } from "../logger.js";
 import { isDiscordAdministrator } from "./authorization.js";
+import type { AuditLogService } from "./audit-log-service.js";
 
 export const BACKUP_SCHEMA_VERSION = 2;
 export const MAX_BACKUP_BYTES = 25 * 1024 * 1024;
@@ -155,11 +156,80 @@ export type RestoreResult = {
   status: "completed" | "completed_with_warnings" | "failed_partial" | "failed";
   warnings: string[];
   criticalFailures: string[];
+  phaseTimingsMs: Record<string, number>;
   safetyBackupId?: string;
   roles: number;
   channels: number;
   overwrites: number;
   members: number;
+};
+
+export type RestoreWarningGroup = {
+  category:
+    | "Discord-controlled guild features"
+    | "Managed/integration roles"
+    | "Protected channels"
+    | "Unsupported properties"
+    | "Hierarchy limitations"
+    | "Other";
+  warnings: string[];
+};
+
+const warningCategory = (warning: string): RestoreWarningGroup["category"] => {
+  const text = warning.toLowerCase();
+  if (/managed|integration/.test(text)) return "Managed/integration roles";
+  if (/protected channel|cannot be deleted|could not be deleted/.test(text))
+    return "Protected channels";
+  if (/hierarchy|highest role|above cookie/.test(text))
+    return "Hierarchy limitations";
+  if (/community|discord-controlled|guild feature/.test(text))
+    return "Discord-controlled guild features";
+  if (/unsupported|not captured|malformed|cosmetic|older backup/.test(text))
+    return "Unsupported properties";
+  return "Other";
+};
+
+/** Keeps final restore UX compact while full warnings remain in restore_operations. */
+export const groupRestoreWarnings = (
+  warnings: string[],
+): RestoreWarningGroup[] => {
+  const groups = new Map<RestoreWarningGroup["category"], string[]>();
+  for (const warning of warnings) {
+    const category = warningCategory(warning);
+    groups.set(category, [...(groups.get(category) ?? []), warning]);
+  }
+  return [...groups.entries()].map(([category, groupedWarnings]) => ({
+    category,
+    warnings: groupedWarnings,
+  }));
+};
+
+const compactWarningSummary = (warnings: string[]): string => {
+  const groups = groupRestoreWarnings(warnings);
+  if (!groups.length) return "None";
+  return groups
+    .map(({ category, warnings: groupedWarnings }) =>
+      `${category}: ${groupedWarnings.length}`,
+    )
+    .join("\n")
+    .slice(0, 1_000);
+};
+
+const notableWarnings = (warnings: string[]): string =>
+  groupRestoreWarnings(warnings)
+    .slice(0, 3)
+    .map(({ category, warnings: groupedWarnings }) =>
+      `• ${category}: ${groupedWarnings[0]}`,
+    )
+    .join("\n")
+    .slice(0, 1_000) || "None";
+
+type RestoreProgressDm = {
+  attempted: boolean;
+  message?: { edit: (payload: any) => Promise<unknown> };
+  lastEditAt: number;
+  phase?: string;
+  phaseStartedAt: number;
 };
 
 /** Maps only destination IDs. Missing targets are deliberately skipped, never guessed. */
@@ -280,6 +350,7 @@ export class BackupService {
   constructor(
     private readonly repo: CookieRepository,
     private readonly client: Client,
+    private readonly audit?: AuditLogService,
   ) {}
 
   /** Logs the Discord REST failure before reducing it to a safe operator message. */
@@ -317,6 +388,11 @@ export class BackupService {
         error: error instanceof Error ? error.name : "unknown",
       }),
     );
+  }
+
+  /** Used only for shutdown observability; restore state itself remains durable in SQLite. */
+  activeRestoreDestinations(): readonly string[] {
+    return [...this.activeRestores];
   }
   stop(): void {
     if (this.timer) clearInterval(this.timer);
@@ -417,6 +493,7 @@ export class BackupService {
           memberAcquisitionMs: memberSnapshot.durationMs,
           totalBackupMs: Math.round(performance.now() - started),
         });
+        if (type === "manual" || type === "automatic") this.audit?.record({ title: type === "manual" ? "Manual Backup Created" : "Automatic Backup Created", category: "Backups", color: "success", priority: type === "manual" ? "normal" : "low", guild: { id: guild.id, name: guild.name }, actor: createdBy ? { id: createdBy } : undefined, details: { Roles: backup.role_count, Channels: backup.channel_count, Overwrites: backup.overwrite_count, Members: backup.member_count, Backup: backup.backup_id } });
         return backup;
       });
     } finally {
@@ -546,7 +623,9 @@ export class BackupService {
   }
   async delete(backupId: string, userId: string): Promise<boolean> {
     const backup = await this.requireAccess(backupId, userId);
-    return this.repo.deleteBackup(backup.backup_id, backup.source_guild_id);
+    const deleted = await this.repo.deleteBackup(backup.backup_id, backup.source_guild_id);
+    if (deleted) this.audit?.record({ title: "Backup Deleted", category: "Backups", color: "danger", priority: "normal", guild: { id: backup.source_guild_id, name: backup.source_guild_name }, actor: { id: userId }, details: { Backup: backup.backup_id } });
+    return deleted;
   }
   async preview(
     backupId: string,
@@ -623,6 +702,7 @@ export class BackupService {
     if ((await this.repo.backupSettings(destination.id)).source_removed_at)
       throw new Error("Destination guild is unavailable.");
     const startedAt = new Date().toISOString(),
+      startedAtMs = Date.now(),
       restoreId = randomUUID(),
       warnings = [...(snapshot.unsupported ?? [])],
       criticalFailures: string[] = [];
@@ -631,22 +711,47 @@ export class BackupService {
       ]),
       channelMap = new Map<string, string>();
     const counts = { roles: 0, channels: 0, overwrites: 0, members: 0 };
+    const unremovableStaleChannels = new Map<string, string>();
     let phase = "safety backup",
       safetyBackupId: string | undefined,
       destructive = false;
+    const phaseTimingsMs: Record<string, number> = {};
+    let phaseStartedAtMs = startedAtMs,
+      lastProgressAtMs = startedAtMs;
     const diagnostics: { restoreId: string; phase: string; operation?: string } = {
       restoreId,
       phase,
     };
     this.restoreDiagnostics.set(destination.id, diagnostics);
+    const closePhase = () => {
+      const durationMs = Math.max(0, Date.now() - phaseStartedAtMs);
+      phaseTimingsMs[phase] = (phaseTimingsMs[phase] ?? 0) + durationMs;
+      if (durationMs >= 30_000)
+        logger.warn("[restore] slow phase", {
+          restoreId,
+          guildId: destination.id,
+          phase,
+          elapsedMs: Date.now() - startedAtMs,
+          durationMs,
+        });
+    };
     const setPhase = (next: string) => {
+      closePhase();
       phase = next;
       diagnostics.phase = next;
+      phaseStartedAtMs = Date.now();
+      logger.info("[restore] phase", {
+        restoreId,
+        guildId: destination.id,
+        phase,
+        elapsedMs: phaseStartedAtMs - startedAtMs,
+      });
     };
     const operation = () => ({
       progress_json: JSON.stringify({
         ...JSON.parse(progressJson(roleMap, channelMap, counts, safetyBackupId)),
         lastOperation: diagnostics.operation,
+        phaseTimingsMs,
       }),
       errors_json: JSON.stringify([...warnings, ...criticalFailures]),
     });
@@ -661,9 +766,50 @@ export class BackupService {
       current_phase: phase,
       ...operation(),
     });
+    this.audit?.record({ title: "Restore Started", category: "Backups", color: "danger", priority: "critical", guild: { id: destination.id, name: destination.name }, actor: { id: userId }, details: { Restore: restoreId, "Source Guild": backup.source_guild_name, "Source Backup": backup.backup_id } });
+    const progressDm = await this.startRestoreProgressDm({
+      backup,
+      destination,
+      userId,
+      restoreId,
+      startedAtMs,
+    });
+    const restoreReport: RestoreProgress = async (label, completed, total) => {
+      const now = Date.now();
+      const elapsedMs = now - startedAtMs;
+      logger.info(
+        `[restore] ${label.toLowerCase()}${completed !== undefined && total !== undefined ? ` ${completed}/${total}` : ""}`,
+        { restoreId, guildId: destination.id, elapsedMs, completed, total },
+      );
+      if (now - lastProgressAtMs >= 30_000)
+        logger.warn("[restore] progress interval exceeded threshold", {
+          restoreId,
+          guildId: destination.id,
+          phase: label,
+          elapsedMs,
+          intervalMs: now - lastProgressAtMs,
+        });
+      lastProgressAtMs = now;
+      await this.updateRestoreProgressDm(progressDm, {
+        backup,
+        destination,
+        phase: label,
+        startedAtMs,
+        completed,
+        total,
+        force: completed === 0 || completed === total,
+        restoreId,
+      });
+      await report?.(label, completed, total);
+    };
+    logger.info("[restore] started", {
+      restoreId,
+      guildId: destination.id,
+      sourceBackupId: backup.backup_id,
+    });
     try {
       this.validateAssets(snapshot, assets);
-      await report?.("Safety Backup");
+      await restoreReport("Safety Backup");
       const safety = await this.create(
         destination,
         userId,
@@ -683,13 +829,13 @@ export class BackupService {
         ...operation(),
       });
       setPhase("destination cleanup");
-      await report?.("Destructive cleanup begins");
+      await restoreReport("Destructive cleanup begins");
       destructive = true;
       await this.deleteDestinationState(
         destination,
         warnings,
         criticalFailures,
-        report,
+        restoreReport,
       );
       this.throwIfCritical(criticalFailures);
 
@@ -698,7 +844,7 @@ export class BackupService {
         current_phase: phase,
         ...operation(),
       });
-      await report?.("Roles", 0, snapshot.roles.length);
+      await restoreReport("Roles", 0, snapshot.roles.length);
       for (let index = 0; index < snapshot.roles.length; index++) {
         const saved = snapshot.roles[index];
         const colors = roleColorsFromSnapshot(saved);
@@ -741,7 +887,7 @@ export class BackupService {
           );
         }
         if (index % 10 === 0 || index + 1 === snapshot.roles.length)
-          await report?.("Roles", index + 1, snapshot.roles.length);
+          await restoreReport("Roles", index + 1, snapshot.roles.length);
       }
       await this.applyRoleHierarchy(
         destination,
@@ -778,7 +924,7 @@ export class BackupService {
         channelMap,
         counts,
         criticalFailures,
-        report,
+        restoreReport,
         "Categories",
       );
       const destinationMembers = await this.acquireMembers(destination);
@@ -793,7 +939,7 @@ export class BackupService {
         counts,
         warnings,
         criticalFailures,
-        report,
+        restoreReport,
       );
       this.throwIfCritical(criticalFailures);
       // Community requires mapped Rules/Updates channels. Create ordinary channels first, then turn it on before announcement channels.
@@ -802,7 +948,7 @@ export class BackupService {
         current_phase: phase,
         ...operation(),
       });
-      await report?.("Community prerequisites");
+      await restoreReport("Community prerequisites");
       const ordinary = snapshot.channels.filter(
         (channel) =>
           channel.type !== ChannelType.GuildCategory &&
@@ -814,7 +960,7 @@ export class BackupService {
         channelMap,
         counts,
         criticalFailures,
-        report,
+        restoreReport,
         "Channels",
       );
       this.throwIfCritical(criticalFailures);
@@ -839,7 +985,7 @@ export class BackupService {
         channelMap,
         counts,
         criticalFailures,
-        report,
+        restoreReport,
         "Announcement channels",
       );
       await this.applyChannelPositions(
@@ -867,7 +1013,7 @@ export class BackupService {
         counts,
         warnings,
         criticalFailures,
-        report,
+        restoreReport,
       );
       this.throwIfCritical(criticalFailures);
       setPhase("member roles");
@@ -881,14 +1027,14 @@ export class BackupService {
         roleMap,
         counts,
         warnings,
-        report,
+        restoreReport,
       );
       setPhase("guild settings");
       await this.repo.updateRestoreOperation(restoreId, {
         current_phase: phase,
         ...operation(),
       });
-      await report?.("Guild settings");
+      await restoreReport("Guild settings");
       await this.restoreGuildSettings(
         destination,
         snapshot,
@@ -898,8 +1044,21 @@ export class BackupService {
         criticalFailures,
       );
       this.throwIfCritical(criticalFailures);
+      setPhase("stale channel cleanup");
+      await this.repo.updateRestoreOperation(restoreId, {
+        current_phase: phase,
+        ...operation(),
+      });
+      await restoreReport("Stale channel cleanup");
+      await this.cleanupStaleChannels(
+        destination,
+        channelMap,
+        unremovableStaleChannels,
+        criticalFailures,
+      );
+      this.throwIfCritical(criticalFailures);
       setPhase("Cookie configuration");
-      await report?.("Cookie Configuration");
+      await restoreReport("Cookie Configuration");
       await this.restoreCookieConfig(
         destination,
         snapshot.cookie,
@@ -913,15 +1072,17 @@ export class BackupService {
         current_phase: phase,
         ...operation(),
       });
-      await report?.("Final Validation");
+      await restoreReport("Final Validation");
       await this.finalValidate(
         destination,
         snapshot,
         roleMap,
         channelMap,
+        unremovableStaleChannels,
         warnings,
         criticalFailures,
       );
+      closePhase();
       const status: RestoreResult["status"] = criticalFailures.length
         ? "failed_partial"
         : warnings.length
@@ -939,9 +1100,19 @@ export class BackupService {
         status,
         warnings,
         criticalFailures,
+        phaseTimingsMs,
         safetyBackupId,
         ...counts,
       };
+      logger.info("[restore] completed", {
+        restoreId,
+        guildId: destination.id,
+        status,
+        elapsedMs: Date.now() - startedAtMs,
+        phaseTimingsMs: JSON.stringify(phaseTimingsMs),
+        warningCount: warnings.length,
+      });
+      this.audit?.record({ title: status === "completed" ? "Restore Completed" : "Restore Completed With Warnings", category: "Backups", color: status === "completed" ? "success" : "warning", priority: "critical", guild: { id: destination.id, name: destination.name }, actor: { id: userId }, details: { Restore: restoreId, "Source Guild": backup.source_guild_name, Roles: counts.roles, Channels: counts.channels, Overwrites: counts.overwrites, "Member Roles": counts.members, Warnings: warnings.length, Duration: this.humanDuration(Date.now() - startedAtMs) } });
       await this.notifyCompletion({
         restoreId,
         backup,
@@ -952,9 +1123,11 @@ export class BackupService {
         result,
         phase: "complete",
         destructive,
+        progressDm,
       });
       return result;
     } catch (error) {
+      closePhase();
       if (error instanceof PartialRestoreError || destructive) {
         if (!(error instanceof PartialRestoreError))
           criticalFailures.push(`${phase} — ${errorText(error)}`);
@@ -969,9 +1142,19 @@ export class BackupService {
           status: "failed_partial",
           warnings,
           criticalFailures,
+          phaseTimingsMs,
           safetyBackupId,
           ...counts,
         };
+        logger.warn("[restore] completed", {
+          restoreId,
+          guildId: destination.id,
+          status: result.status,
+          elapsedMs: Date.now() - startedAtMs,
+          phaseTimingsMs: JSON.stringify(phaseTimingsMs),
+          warningCount: warnings.length,
+        });
+        this.audit?.record({ title: "Restore Failed Partially", category: "Backups", color: "danger", priority: "critical", guild: { id: destination.id, name: destination.name }, actor: { id: userId }, reason: criticalFailures[0] ?? "Restore completed with critical failures.", details: { Restore: restoreId, Phase: phase, Warnings: warnings.length, Duration: this.humanDuration(Date.now() - startedAtMs) } });
         await this.notifyCompletion({
           restoreId,
           backup,
@@ -982,6 +1165,7 @@ export class BackupService {
           result,
           phase,
           destructive,
+          progressDm,
         });
         return result;
       }
@@ -995,6 +1179,15 @@ export class BackupService {
         ]),
         completed: true,
       });
+      logger.warn("[restore] completed", {
+        restoreId,
+        guildId: destination.id,
+        status: "failed",
+        elapsedMs: Date.now() - startedAtMs,
+        phaseTimingsMs: JSON.stringify(phaseTimingsMs),
+        warningCount: warnings.length,
+      });
+      this.audit?.record({ title: "Restore Failed", category: "Backups", color: "danger", priority: "critical", guild: { id: destination.id, name: destination.name }, actor: { id: userId }, reason: errorText(error), details: { Restore: restoreId, Phase: phase, Duration: this.humanDuration(Date.now() - startedAtMs) } });
       await this.notifyCompletion({
         restoreId,
         backup,
@@ -1006,6 +1199,7 @@ export class BackupService {
           restoreId,
           status: "failed",
           warnings,
+          phaseTimingsMs,
           criticalFailures: [
             ...criticalFailures,
             `${phase} — ${errorText(error)}`,
@@ -1016,10 +1210,149 @@ export class BackupService {
         phase,
         destructive,
         failure: error,
+        progressDm,
       });
       throw error;
     } finally {
       this.restoreDiagnostics.delete(destination.id);
+    }
+  }
+
+  private restoreProgressEmbed(input: {
+    backup: GuildBackup;
+    destination: Guild;
+    phase: string;
+    startedAtMs: number;
+    completed?: number;
+    total?: number;
+    phaseStartedAt: number;
+  }): EmbedBuilder {
+    const elapsedMs = Math.max(0, Date.now() - input.startedAtMs);
+    const progress =
+      input.completed !== undefined && input.total !== undefined && input.total > 0
+        ? `${Math.round((input.completed / input.total) * 100)}% (${input.completed}/${input.total})`
+        : "Calculating...";
+    const phaseElapsedMs = Math.max(0, Date.now() - input.phaseStartedAt);
+    const etaMs =
+      input.completed !== undefined &&
+      input.total !== undefined &&
+      input.completed >= 2 &&
+      input.total > input.completed &&
+      phaseElapsedMs >= 3_000
+        ? Math.round(((input.total - input.completed) * phaseElapsedMs) / input.completed)
+        : undefined;
+    return new EmbedBuilder()
+      .setColor(0x5865f2)
+      .setTitle("Server Restore Running")
+      .addFields(
+        {
+          name: "Source backup",
+          value: `${input.backup.source_guild_name} (${input.backup.backup_id.slice(0, 8)})`,
+          inline: true,
+        },
+        {
+          name: "Destination",
+          value: input.destination.name || input.destination.id,
+          inline: true,
+        },
+        { name: "Current phase", value: input.phase, inline: true },
+        { name: "Progress", value: progress, inline: true },
+        { name: "Elapsed", value: this.humanDuration(elapsedMs), inline: true },
+        {
+          name: "Estimated remaining",
+          value: etaMs === undefined ? "Calculating..." : this.humanDuration(etaMs),
+          inline: true,
+        },
+      );
+  }
+
+  private async startRestoreProgressDm(input: {
+    backup: GuildBackup;
+    destination: Guild;
+    userId: string;
+    restoreId: string;
+    startedAtMs: number;
+  }): Promise<RestoreProgressDm> {
+    const progress: RestoreProgressDm = {
+      attempted: true,
+      lastEditAt: 0,
+      phase: "Safety Backup",
+      phaseStartedAt: input.startedAtMs,
+    };
+    try {
+      const user = await this.client.users.fetch(input.userId);
+      progress.message = await user.send({
+        embeds: [
+          this.restoreProgressEmbed({
+            backup: input.backup,
+            destination: input.destination,
+            phase: progress.phase ?? "Safety Backup",
+            startedAtMs: input.startedAtMs,
+            phaseStartedAt: progress.phaseStartedAt,
+          }),
+        ],
+      });
+      progress.lastEditAt = Date.now();
+      logger.info("[restore] progress DM started", {
+        restoreId: input.restoreId,
+        guildId: input.destination.id,
+        userId: input.userId,
+      });
+    } catch (error) {
+      logger.warn("[restore] progress DM unavailable", {
+        restoreId: input.restoreId,
+        guildId: input.destination.id,
+        userId: input.userId,
+        reason: errorText(error),
+      });
+    }
+    return progress;
+  }
+
+  private async updateRestoreProgressDm(
+    progress: RestoreProgressDm,
+    input: {
+      backup: GuildBackup;
+      destination: Guild;
+      phase: string;
+      startedAtMs: number;
+      completed?: number;
+      total?: number;
+      force?: boolean;
+      restoreId: string;
+    },
+  ): Promise<void> {
+    if (!progress.message) return;
+    const now = Date.now();
+    const phaseChanged = progress.phase !== input.phase;
+    if (phaseChanged) {
+      progress.phase = input.phase;
+      progress.phaseStartedAt = now;
+    }
+    if (!input.force && !phaseChanged && now - progress.lastEditAt < 5_000)
+      return;
+    progress.lastEditAt = now;
+    try {
+      await progress.message.edit({
+        embeds: [
+          this.restoreProgressEmbed({
+            backup: input.backup,
+            destination: input.destination,
+            phase: input.phase,
+            startedAtMs: input.startedAtMs,
+            completed: input.completed,
+            total: input.total,
+            phaseStartedAt: progress.phaseStartedAt,
+          }),
+        ],
+      });
+    } catch (error) {
+      progress.message = undefined;
+      logger.warn("[restore] progress DM edit unavailable", {
+        restoreId: input.restoreId,
+        guildId: input.destination.id,
+        reason: errorText(error),
+      });
     }
   }
 
@@ -1034,6 +1367,7 @@ export class BackupService {
     phase: string;
     destructive: boolean;
     failure?: unknown;
+    progressDm?: RestoreProgressDm;
   }): Promise<void> {
     if (!(await this.repo.claimCompletionDm(input.restoreId))) return;
     const finishedAt = new Date().toISOString();
@@ -1044,9 +1378,7 @@ export class BackupService {
     const failed =
       input.result.status === "failed" ||
       input.result.status === "failed_partial";
-    const warningSummary = input.result.warnings.length
-      ? `${input.result.warnings.length} warning${input.result.warnings.length === 1 ? "" : "s"}; ${[...new Set(input.result.warnings.map((warning) => warning.split("—", 1)[0].slice(0, 80)))].slice(0, 3).join(" • ")}`
-      : "None";
+    const warningSummary = compactWarningSummary(input.result.warnings);
     const title = failed
       ? "Server Restore Failed"
       : input.result.warnings.length
@@ -1130,14 +1462,34 @@ export class BackupService {
           value: input.snapshot.guild.communityEnabled ? "Enabled" : "Disabled",
           inline: true,
         },
-        { name: "Warnings", value: warningSummary, inline: false },
+        { name: "Warning summary", value: warningSummary, inline: false },
+        {
+          name: "Notable warnings",
+          value: notableWarnings(input.result.warnings),
+          inline: false,
+        },
+        {
+          name: "Phase timings",
+          value:
+            Object.entries(input.result.phaseTimingsMs ?? {})
+              .map(([name, ms]) => `${name}: ${this.humanDuration(ms)}`)
+              .join("\n")
+              .slice(0, 1_000) || "No phase timings recorded.",
+          inline: false,
+        },
       );
     }
     try {
-      const user = await this.client.users.fetch(input.userId);
-      await user.send({ embeds: [embed] });
+      if (input.progressDm?.attempted && !input.progressDm.message)
+        throw new Error("The initial restore progress DM was unavailable.");
+      if (input.progressDm?.message)
+        await input.progressDm.message.edit({ embeds: [embed] });
+      else {
+        const user = await this.client.users.fetch(input.userId);
+        await user.send({ embeds: [embed] });
+      }
       await this.repo.completeCompletionDm(input.restoreId, true);
-      logger.info("restore completion DM sent", {
+      logger.info("[restore] progress DM finalized", {
         restoreId: input.restoreId,
         guildId: input.destination.id,
         userId: input.userId,
@@ -1188,6 +1540,18 @@ export class BackupService {
     if (critical.length)
       throw new PartialRestoreError(critical[critical.length - 1]);
   }
+  private guildChannelReferences(guild: any, channelId: string): string[] {
+    return [
+      ["rulesChannel", guild.rulesChannelId],
+      ["publicUpdatesChannel", guild.publicUpdatesChannelId],
+      ["safetyAlertsChannel", guild.safetyAlertsChannelId],
+      ["systemChannel", guild.systemChannelId],
+      ["afkChannel", guild.afkChannelId],
+      ["widgetChannel", guild.widgetChannelId],
+    ]
+      .filter(([, id]) => id === channelId)
+      .map(([label]) => label as string);
+  }
   private async deleteDestinationState(
     guild: Guild,
     warnings: string[],
@@ -1212,9 +1576,16 @@ export class BackupService {
     for (let index = 0; index < channels.length; index++) {
       const channel: any = channels[index];
       if (!channel.deletable) {
-        warnings.push(
-          `Destination channel ${channel.name} is Discord-protected or above Cookie and was preserved.`,
-        );
+        const references = this.guildChannelReferences(guild, channel.id);
+        logger.warn("[restore] destination channel deferred", {
+          guildId: guild.id,
+          channelId: channel.id,
+          channelName: channel.name,
+          references: references.join(",") || "none",
+          reason: references.length
+            ? "Referenced by active guild settings before reconciliation"
+            : "discord.js reports channel.deletable=false before reconciliation",
+        });
         continue;
       }
       try {
@@ -1253,6 +1624,63 @@ export class BackupService {
       } catch (error) {
         critical.push(
           `Destination role ${role.name} could not be deleted — ${errorText(error)}`,
+        );
+      }
+    }
+  }
+  /** Removes leftovers only after Community and channel-backed guild settings point at restored channels. */
+  private async cleanupStaleChannels(
+    guild: Guild,
+    channelMap: Map<string, string>,
+    unremovable: Map<string, string>,
+    critical: string[],
+  ): Promise<void> {
+    const references: any =
+      (await (guild as any).fetch?.().catch(() => guild)) ?? guild;
+    const expected = new Set(channelMap.values());
+    const stale = [...guild.channels.cache.values()]
+      .filter(
+        (channel: any) =>
+          supportedChannelTypes.includes(channel.type) && !expected.has(channel.id),
+      )
+      .sort(
+        (a: any, b: any) =>
+          Number(a.type === ChannelType.GuildCategory) -
+          Number(b.type === ChannelType.GuildCategory),
+      );
+    for (const channel of stale as any[]) {
+      const activeReferences = this.guildChannelReferences(references, channel.id);
+      if (!channel.deletable) {
+        const reason = activeReferences.length
+          ? `Discord still references it as ${activeReferences.join(", ")}`
+          : "discord.js reports channel.deletable=false after settings reconciliation";
+        unremovable.set(channel.id, reason);
+        logger.warn("[restore] stale channel cannot be deleted", {
+          guildId: guild.id,
+          channelId: channel.id,
+          channelName: channel.name,
+          references: activeReferences.join(",") || "none",
+          reason,
+        });
+        continue;
+      }
+      logger.info("[restore] deleting stale channel after reconciliation", {
+        guildId: guild.id,
+        channelId: channel.id,
+        channelName: channel.name,
+        references: activeReferences.join(",") || "none",
+      });
+      try {
+        await channel.delete(
+          "Cookie full backup restore: post-reconciliation stale channel cleanup",
+        );
+        guild.channels.cache.delete?.(channel.id);
+      } catch (error) {
+        this.restoreError(guild, "channel.delete.stale", error, {
+          channelId: channel.id,
+        });
+        critical.push(
+          `Stale channel ${channel.name} could not be deleted after settings reconciliation — ${errorText(error)}`,
         );
       }
     }
@@ -1597,42 +2025,6 @@ export class BackupService {
         true,
       );
     await this.restoreGuildAssets(guild, setting, assets, warnings, critical);
-    return;
-    /*
-    const payload: any = {
-      name: setting.name,
-      verificationLevel: setting.verificationLevel,
-      explicitContentFilter: setting.explicitContentFilter,
-      defaultMessageNotifications: setting.defaultMessageNotifications,
-      afkTimeout: setting.afkTimeout,
-      reason: "Cookie full backup restore",
-    };
-    if ("description" in setting) payload.description = setting.description;
-    if ("afkChannelId" in setting)
-      payload.afkChannel = mapped(setting.afkChannelId);
-    if ("systemChannelId" in setting)
-      payload.systemChannel = mapped(setting.systemChannelId);
-    if ("systemChannelFlags" in setting)
-      payload.systemChannelFlags = systemChannelFlagsFromSnapshot(setting.systemChannelFlags);
-    if ("rulesChannelId" in setting)
-      payload.rulesChannel = mapped(setting.rulesChannelId);
-    if ("publicUpdatesChannelId" in setting)
-      payload.publicUpdatesChannel = mapped(setting.publicUpdatesChannelId);
-    if ("safetyAlertsChannelId" in setting)
-      payload.safetyAlertsChannel = mapped(setting.safetyAlertsChannelId);
-    if ("preferredLocale" in setting)
-      payload.preferredLocale = setting.preferredLocale;
-    if ("premiumProgressBarEnabled" in setting)
-      payload.premiumProgressBarEnabled = setting.premiumProgressBarEnabled;
-    try {
-      await guild.edit(payload);
-    } catch (error) {
-      critical.push(
-        `Guild settings could not be restored — ${errorText(error)}`,
-      );
-    }
-    await this.restoreGuildAssets(guild, setting, assets, warnings, critical);
-    */
   }
 
   private async restoreGuildAssets(
@@ -2179,6 +2571,7 @@ export class BackupService {
     snapshot: Snapshot,
     roleMap: Map<string, string>,
     channelMap: Map<string, string>,
+    unremovableStaleChannels: Map<string, string>,
     warnings: string[],
     critical: string[],
   ): Promise<void> {
@@ -2249,6 +2642,22 @@ export class BackupService {
           `Final validation: role ${saved.name} does not match its backup.`,
         );
     }
+    const expectedRoleIds = new Set(roleMap.values());
+    const unexpectedOrdinaryRoles = [
+      ...(destination.roles.cache.values() as Iterable<any>),
+    ].filter(
+      (role) =>
+        role.id !== destination.roles.everyone?.id &&
+        role.managed !== true &&
+        !expectedRoleIds.has(role.id),
+    );
+    if (unexpectedOrdinaryRoles.length)
+      critical.push(
+        `Final validation: ${unexpectedOrdinaryRoles.length} unexpected ordinary role${unexpectedOrdinaryRoles.length === 1 ? "" : "s"} remain after restore (${unexpectedOrdinaryRoles
+          .slice(0, 3)
+          .map((role) => role.name)
+          .join(", ")}).`,
+      );
     for (const saved of snapshot.channels) {
       const id = channelMap.get(saved.id),
         channel: any = id ? destination.channels.cache.get(id) : undefined;
@@ -2307,6 +2716,29 @@ export class BackupService {
           );
       }
     }
+    const expectedChannelIds = new Set(channelMap.values());
+    const unexpectedChannels = [
+      ...(destination.channels.cache.values() as Iterable<any>),
+    ].filter(
+      (channel) =>
+        supportedChannelTypes.includes(channel.type) &&
+        !expectedChannelIds.has(channel.id) &&
+        !unremovableStaleChannels.has(channel.id),
+    );
+    for (const [channelId, reason] of unremovableStaleChannels) {
+      const channel: any = destination.channels.cache.get(channelId);
+      if (channel)
+        warnings.push(
+          `Final validation: stale channel ${channel.name} remains because ${reason}.`,
+        );
+    }
+    if (unexpectedChannels.length)
+      critical.push(
+        `Final validation: ${unexpectedChannels.length} unexpected channel or category${unexpectedChannels.length === 1 ? "" : "ies"} remain after restore (${unexpectedChannels
+          .slice(0, 3)
+          .map((channel) => channel.name)
+          .join(", ")}).`,
+      );
     if (typeof snapshot.guild.communityEnabled === "boolean") {
       const community = snapshot.guild.communityEnabled;
       if (

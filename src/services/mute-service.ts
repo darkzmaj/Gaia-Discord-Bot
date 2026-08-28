@@ -3,6 +3,7 @@ import type { CookieRepository } from '../db/repositories.js';
 import { MAX_MUTE_MS, humanDuration } from './duration.js';
 import { logger } from '../logger.js';
 import { KeyedLock } from './locks.js';
+import type { AuditLogService } from './audit-log-service.js';
 
 export type MuteResult = { error?: string; expiresAt?: Date; dmDelivered?: boolean };
 export type UnmuteResult = { changed: boolean; dmDelivered?: boolean; error?: string };
@@ -11,7 +12,7 @@ const mutedPermissions = [PermissionsBitField.Flags.SendMessages, PermissionsBit
 export class MuteService {
   private timer?: NodeJS.Timeout;
   private readonly locks = new KeyedLock();
-  constructor(private readonly repo: CookieRepository, private readonly guilds: () => Iterable<Guild>) {}
+  constructor(private readonly repo: CookieRepository, private readonly guilds: () => Iterable<Guild>, private readonly audit?: AuditLogService) {}
   start(): void { this.timer = setInterval(() => void this.expireDue().catch((error) => logger.error('mute expiry sweep failed', { error: error instanceof Error ? error.name : 'unknown' })), 30_000); void this.expireDue().catch((error) => logger.error('initial mute expiry sweep failed', { error: error instanceof Error ? error.name : 'unknown' })); void this.recoverActive().catch((error) => logger.error('mute recovery failed', { error: error instanceof Error ? error.name : 'unknown' })); }
   stop(): void { if (this.timer) clearInterval(this.timer); this.timer = undefined; }
 
@@ -24,19 +25,21 @@ export class MuteService {
     if (!(await this.repo.settings(guild.id)).moderation_enabled) return { error: 'Moderation is disabled on this server.' };
     const start = new Date(), expiresAt = new Date(start.getTime() + durationMs);
     if (!(await this.repo.addMute({ guild_id: guild.id, user_id: member.id, moderator_id: moderator.id, reason: reason ?? null, started_at: start.toISOString(), expires_at: expiresAt.toISOString() }))) return { error: 'That member is already muted.' };
-    try { await this.applyGuild(guild, member.id); } catch { await this.restore(guild, member.id).catch(() => undefined); await this.repo.removeMute(guild.id, member.id); return { error: 'Cookie could not apply mute channel restrictions. Check Manage Channels permission.' }; }
+    try { await this.applyGuild(guild, member.id); } catch { await this.restore(guild, member.id).catch(() => undefined); await this.repo.removeMute(guild.id, member.id); this.audit?.record({ title: 'Mute Failed', category: 'Moderation', color: 'danger', priority: 'critical', guild: { id: guild.id, name: guild.name }, target: { id: member.id, name: member.user.tag }, actor: { id: moderator.id, name: moderator.user.tag }, reason: 'Cookie could not apply mute channel restrictions.' }); return { error: 'Cookie could not apply mute channel restrictions. Check Manage Channels permission.' }; }
     const dmDelivered = await this.dmMuted(member, guild, durationMs, expiresAt, reason);
     logger.info('member muted', { guildId: guild.id, userId: member.id, moderatorId: moderator.id });
+    this.audit?.record({ title: 'Member Muted', category: 'Moderation', color: 'danger', priority: 'critical', guild: { id: guild.id, name: guild.name }, target: { id: member.id, name: member.user.tag }, actor: { id: moderator.id, name: moderator.user.tag }, reason, details: { Duration: humanDuration(durationMs) } });
     return { expiresAt, dmDelivered };
   }); }
 
   async unmute(guild: Guild, userId: string, reason: string, automaticOrModerator?: boolean | GuildMember): Promise<UnmuteResult> { const automatic = automaticOrModerator === true; return this.locks.run(`${guild.id}:${userId}`, async () => {
     if (!(await this.repo.mute(guild.id, userId))) return { changed: false };
-    try { await this.restore(guild, userId); } catch { return { changed: false, error: 'Cookie could not restore this member’s channel permissions.' }; }
+    try { await this.restore(guild, userId); } catch { this.audit?.record({ title: 'Unmute Failed', category: 'Moderation', color: 'danger', priority: 'critical', guild: { id: guild.id, name: guild.name }, target: { id: userId }, reason: 'Cookie could not restore channel permissions.' }); return { changed: false, error: 'Cookie could not restore this member’s channel permissions.' }; }
     await this.repo.removeMute(guild.id, userId);
     const member = await guild.members.fetch(userId).catch(() => null);
     const dmDelivered = member ? await this.dmUnmuted(member, guild, reason, automatic) : false;
     logger.info('member unmuted', { guildId: guild.id, userId, automatic });
+    this.audit?.record({ title: automatic ? 'Mute Automatically Expired' : 'Member Unmuted', category: 'Moderation', color: automatic ? 'info' : 'success', priority: automatic ? 'normal' : 'critical', guild: { id: guild.id, name: guild.name }, target: { id: userId, name: member?.user.tag }, actor: automatic ? undefined : typeof automaticOrModerator === 'object' ? { id: automaticOrModerator.id, name: automaticOrModerator.user.tag } : undefined, reason: automatic ? undefined : reason });
     return { changed: true, dmDelivered };
   }); }
 

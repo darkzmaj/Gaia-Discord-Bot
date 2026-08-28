@@ -94,7 +94,13 @@ export class VoiceRoomService {
       oldChannel = oldState.channel,
       newChannel = state.channel;
     if (oldChannel?.id !== newChannel?.id && oldChannel)
-      void this.reconcileRoom(guild, oldChannel);
+      void this.reconcileRoom(guild, oldChannel).catch((error) =>
+        logger.error("voice room reconciliation failed", {
+          guildId: guild.id,
+          channelId: oldChannel.id,
+          error: error instanceof Error ? error.name : "unknown",
+        }),
+      );
     if (
       !newChannel ||
       oldChannel?.id === newChannel.id ||
@@ -322,7 +328,7 @@ export class VoiceRoomService {
       !channelId ||
       !(await this.authorizedRoom(i.guild, channelId, i.user.id))
     )
-      return void i.reply({
+      return void await i.reply({
         content: "You are not the current owner of this room.",
         flags: MessageFlags.Ephemeral,
       });
@@ -335,16 +341,16 @@ export class VoiceRoomService {
         p.is_locked ? 0 : 1,
       );
       await this.applyAndRefresh(i.guild, channelId, i.user.id);
-      return void i.reply({
+      return void await i.reply({
         content: p.is_locked ? "Room unlocked." : "Room locked.",
         flags: MessageFlags.Ephemeral,
       });
     }
-    if (action === "limit") return void i.showModal(this.limitModal(channelId));
+    if (action === "limit") return void await i.showModal(this.limitModal(channelId));
     if (action === "rename")
-      return void i.showModal(this.renameModal(channelId));
+      return void await i.showModal(this.renameModal(channelId));
     if (action === "allow" || action === "deny")
-      return void i.reply({
+      return void await i.reply({
         content: `Select a member to ${action}.`,
         components: [
           new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(
@@ -357,9 +363,9 @@ export class VoiceRoomService {
         ],
         flags: MessageFlags.Ephemeral,
       });
-    if (action === "manage") return void this.showAccess(i, channelId);
+    if (action === "manage") return await this.showAccess(i, channelId);
     if (action === "reset")
-      return void i.reply({
+      return void await i.reply({
         embeds: [
           new EmbedBuilder()
             .setColor(0xed4245)
@@ -390,35 +396,42 @@ export class VoiceRoomService {
       !channelId ||
       !(await this.authorizedRoom(i.guild, channelId, i.user.id))
     )
-      return void i.reply({
+      return void await i.reply({
         content: "You are not the current owner of this room.",
         flags: MessageFlags.Ephemeral,
       });
     if (action === "rename") {
       const name = i.fields.getTextInputValue("name").trim();
       if (!name || name.length > 20)
-        return void i.reply({
+        return void await i.reply({
           content: "Room names must be between 1 and 20 characters.",
           flags: MessageFlags.Ephemeral,
         });
       const key = `${i.guild.id}:${channelId}`,
         last = this.renameCooldowns.get(key) ?? 0;
       if (Date.now() - last < 5_000)
-        return void i.reply({
+        return void await i.reply({
           content: "Please wait a few seconds before renaming again.",
           flags: MessageFlags.Ephemeral,
         });
       const channel = i.guild.channels.cache.get(channelId);
       if (!channel?.isVoiceBased())
-        return void i.reply({
+        return void await i.reply({
           content: "That room no longer exists.",
           flags: MessageFlags.Ephemeral,
         });
-      await channel.setName(name, "Cookie room rename").catch(() => null);
+      try {
+        await channel.setName(name, "Cookie room rename");
+      } catch {
+        return void await i.reply({
+          content: "Cookie could not rename that room.",
+          flags: MessageFlags.Ephemeral,
+        });
+      }
       this.renameCooldowns.set(key, Date.now());
       await this.setPreference(i.guild.id, i.user.id, "custom_name", name);
       await this.refreshPanel(i.guild, channelId);
-      return void i.reply({
+      return void await i.reply({
         content: `Room renamed to **${name}**.`,
         flags: MessageFlags.Ephemeral,
       });
@@ -426,7 +439,7 @@ export class VoiceRoomService {
     if (action !== "limit") return;
     const value = i.fields.getTextInputValue("limit").trim();
     if (!/^\d+$/.test(value) || Number(value) > 25)
-      return void i.reply({
+      return void await i.reply({
         content: "Enter a whole number from 1 to 25, or 0 for unlimited.",
         flags: MessageFlags.Ephemeral,
       });
@@ -447,7 +460,7 @@ export class VoiceRoomService {
       !["allow", "deny"].includes(action) ||
       !(await this.authorizedRoom(i.guild, channelId, i.user.id))
     )
-      return void i.reply({
+      return void await i.reply({
         content: "You are not the current owner of this room.",
         flags: MessageFlags.Ephemeral,
       });
@@ -456,7 +469,7 @@ export class VoiceRoomService {
       i.guild.members.cache.get(userId) ??
       (await i.guild.members.fetch(userId).catch(() => null));
     if (!member)
-      return void i.reply({
+      return void await i.reply({
         content: "That user is no longer in this server.",
         flags: MessageFlags.Ephemeral,
       });
@@ -481,7 +494,7 @@ export class VoiceRoomService {
       !["allowed", "denied"].includes(list) ||
       !(await this.authorizedRoom(i.guild, channelId, i.user.id))
     )
-      return void i.reply({
+      return void await i.reply({
         content: "You are not the current owner of this room.",
         flags: MessageFlags.Ephemeral,
       });
@@ -503,12 +516,12 @@ export class VoiceRoomService {
       !channelId ||
       !(await this.authorizedRoom(i.guild, channelId, i.user.id))
     )
-      return void i.reply({
+      return void await i.reply({
         content: "You are not the current owner of this room.",
         flags: MessageFlags.Ephemeral,
       });
     if (action === "cancel")
-      return void i.update({
+      return void await i.update({
         content: "Reset cancelled.",
         embeds: [],
         components: [],

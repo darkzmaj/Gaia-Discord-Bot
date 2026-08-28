@@ -16,6 +16,7 @@ import type {
 } from "../db/repositories.js";
 import type { VoiceRoomService } from "./voice-room-service.js";
 import { KeyedLock } from "./locks.js";
+import type { AuditLogService } from "./audit-log-service.js";
 
 export const normalizeVerificationColor = (input: string): number | null => {
   const value = input.trim().replace(/^#/, "");
@@ -24,7 +25,7 @@ export const normalizeVerificationColor = (input: string): number | null => {
 
 export class VerificationService {
   private readonly locks = new KeyedLock();
-  constructor(private readonly repo: CookieRepository) {}
+  constructor(private readonly repo: CookieRepository, private readonly audit?: AuditLogService) {}
 
   async button(interaction: ButtonInteraction): Promise<void> {
     if (!interaction.guild) return;
@@ -33,7 +34,7 @@ export class VerificationService {
       async () => {
         const config = await this.repo.verification(interaction.guild!.id);
         if (!config.enabled)
-          return void interaction.reply({
+          return void await interaction.reply({
             content: "🔴 Verification is currently disabled on this server.",
             flags: MessageFlags.Ephemeral,
           });
@@ -44,35 +45,37 @@ export class VerificationService {
           .guild!.members.fetch(interaction.user.id)
           .catch(() => null);
         if (!role || !member)
-          return void interaction.reply({
+          return void await interaction.reply({
             content:
               "Verification is not configured correctly. Please contact an administrator.",
             flags: MessageFlags.Ephemeral,
           });
         if (!this.assignable(interaction.guild!, role))
-          return void interaction.reply({
+          return void await interaction.reply({
             content: "Cookie cannot assign the configured verification role.",
             flags: MessageFlags.Ephemeral,
           });
         if (member.roles.cache.has(role.id))
-          return void interaction.reply({
+          return void await interaction.reply({
             content: "🟢 You are already verified.",
             flags: MessageFlags.Ephemeral,
           });
         await member.roles
           .add(role, "Cookie verification")
-          .then(() =>
-            interaction.reply({
+          .then(() => {
+            this.audit?.record({ title: "Member Verified", category: "Verification", color: "success", guild: { id: interaction.guild!.id, name: interaction.guild!.name }, target: { id: member.id, name: member.user.tag }, details: { Role: role.name } });
+            return interaction.reply({
               content: "🟢 You have been verified.",
               flags: MessageFlags.Ephemeral,
-            }),
-          )
-          .catch(() =>
-            interaction.reply({
+            });
+          })
+          .catch(() => {
+            this.audit?.record({ title: "Verification Failed", category: "Verification", color: "danger", priority: "critical", guild: { id: interaction.guild!.id, name: interaction.guild!.name }, target: { id: interaction.user.id, name: interaction.user.tag }, reason: "Cookie could not assign the verification role." });
+            return interaction.reply({
               content: "Cookie could not assign the verification role.",
               flags: MessageFlags.Ephemeral,
-            }),
-          );
+            });
+          });
       },
     );
   }
@@ -80,6 +83,7 @@ export class VerificationService {
   async unverify(
     guild: Guild,
     userId: string,
+    executor?: { id: string; user?: { tag?: string } },
   ): Promise<{ changed: boolean; error?: string }> {
     const config = await this.repo.verification(guild.id);
     if (!config.role_id)
@@ -113,6 +117,7 @@ export class VerificationService {
       if (!member.roles.cache.has(role.id)) return { changed: false };
       try {
         await member.roles.remove(role, "Cookie unverify");
+        this.audit?.record({ title: "Member Unverified", category: "Verification", color: "warning", priority: "critical", guild: { id: guild.id, name: guild.name }, target: { id: member.id, name: member.user.tag }, actor: executor ? { id: executor.id, name: executor.user?.tag } : undefined, details: { Role: role.name } });
         return { changed: true };
       } catch {
         return {
@@ -209,6 +214,7 @@ export class VerificationService {
       };
     if (current.enabled === Number(enabled)) return { changed: false };
     await this.repo.updateVerification(guild.id, { enabled: enabled ? 1 : 0 });
+    this.audit?.record({ title: `Verification ${enabled ? "Enabled" : "Disabled"}`, category: "Verification", color: "warning", guild: { id: guild.id, name: guild.name } });
     await rooms.reconcileGuildAccess(guild, current.role_id);
     return { changed: true };
   }

@@ -34,6 +34,7 @@ import { MuteService } from "../src/services/mute-service.js";
 import {
   BACKUP_SCHEMA_VERSION,
   BackupService,
+  groupRestoreWarnings,
   mapPermissionOverwrites,
   MAX_BACKUP_BYTES,
   roleColorsFromSnapshot,
@@ -47,6 +48,11 @@ import {
 import { AdminUi } from "../src/services/admin-ui.js";
 import { CookieBot } from "../src/bot.js";
 import { config } from "../src/config.js";
+import {
+  AuditLogService,
+  sanitizeAuditText,
+  validateAuditLogConfig,
+} from "../src/services/audit-log-service.js";
 
 const databases: SqliteDatabase[] = [];
 async function repo(): Promise<CookieRepository> {
@@ -56,6 +62,117 @@ async function repo(): Promise<CookieRepository> {
 }
 afterEach(async () => {
   await Promise.all(databases.splice(0).map((db) => db.close()));
+});
+
+describe("production audit logging", () => {
+  const logging = {
+    webhookUrl: "https://discord.com/api/webhooks/123456789012345678/abcdefghijklmnopqrstuvwxyz",
+    guildId: "123456789012345678",
+    channelId: "223456789012345678",
+  };
+  const ok = (body: object = {}) => new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+  it("keeps logging disabled for absent, incomplete, and invalid configuration", () => {
+    expect(validateAuditLogConfig({})).toMatchObject({ enabled: false, reason: "not configured" });
+    expect(validateAuditLogConfig({ guildId: logging.guildId })).toMatchObject({ enabled: false, reason: "incomplete configuration" });
+    expect(validateAuditLogConfig({ ...logging, webhookUrl: "https://example.com/not-a-webhook" })).toMatchObject({ enabled: false, reason: "invalid webhook URL" });
+    expect(new AuditLogService({}).enabled).toBe(false);
+  });
+  it("rejects a webhook whose configured guild does not match", async () => {
+    const service = new AuditLogService(logging, async () => ok({ guild_id: "999999999999999999", channel_id: logging.channelId }));
+    await service.initialize();
+    expect(service.enabled).toBe(false);
+  });
+  it("rejects a webhook whose configured channel does not match", async () => {
+    const service = new AuditLogService(logging, async () => ok({ guild_id: logging.guildId, channel_id: "999999999999999999" }));
+    await service.initialize();
+    expect(service.enabled).toBe(false);
+  });
+  it("rejects an invalid or deleted webhook without affecting Cookie", async () => {
+    const service = new AuditLogService(logging, async () => new Response(null, { status: 404 }));
+    await expect(service.initialize()).resolves.toBeUndefined();
+    expect(service.enabled).toBe(false);
+  });
+  it("handles a transient webhook API failure safely and leaves validation retryable", async () => {
+    const service = new AuditLogService(logging, async () => { throw new Error("temporary network failure"); });
+    await expect(service.initialize()).resolves.toBeUndefined();
+    expect(service.enabled).toBe(false);
+    await service.shutdown();
+  });
+  it("validates and sends through guild B's webhook when Cookie is only in guild A", async () => {
+    const cookieGuildIds = ["333333333333333333"];
+    expect(cookieGuildIds).not.toContain(logging.guildId);
+    let sends = 0;
+    const service = new AuditLogService(logging, async (_url, init) => {
+      if (!init?.method) return ok({ guild_id: logging.guildId, channel_id: logging.channelId });
+      sends++; return new Response(null, { status: 204 });
+    });
+    expect(service.enabled).toBe(false);
+    await service.initialize();
+    service.record({ title: "Cross-guild Audit", category: "Bot" });
+    await (service as any).working;
+    expect(service.enabled).toBe(true);
+    expect(sends).toBe(1);
+  });
+  it("delivers compact no-ping embeds and sanitizes secrets", async () => {
+    const calls: Array<{ input: string; init?: RequestInit }> = [];
+    const service = new AuditLogService(logging, async (input, init) => {
+      calls.push({ input, init });
+      return calls.length === 1 ? ok({ guild_id: logging.guildId, channel_id: logging.channelId }) : new Response(null, { status: 204 });
+    });
+    await service.initialize();
+    service.record({ title: "Member Muted", category: "Moderation", guild: { id: "g", name: "@everyone" }, reason: "https://discord.com/api/webhooks/123456789012345678/secret" });
+    await (service as any).working;
+    const payload = JSON.parse(String(calls[1].init?.body));
+    expect(payload.allowed_mentions).toEqual({ parse: [], users: [], roles: [], replied_user: false });
+    expect(JSON.stringify(payload)).not.toContain("/secret");
+    expect(sanitizeAuditText("https://discord.com/api/webhooks/123456789012345678/secret")).toContain("redacted");
+  });
+  it("retries transient failures, drops permanent failures, and bounds the queue", async () => {
+    let post = 0;
+    const service = new AuditLogService(logging, async (_input, init) => {
+      if (!init?.method) return ok({ guild_id: logging.guildId, channel_id: logging.channelId });
+      post++;
+      return post < 3 ? new Response(null, { status: 500 }) : new Response(null, { status: 204 });
+    });
+    await service.initialize();
+    service.record({ title: "Restore Failed", category: "Backups", priority: "critical" });
+    await (service as any).working;
+    expect(post).toBe(3);
+    for (let index = 0; index < 100; index++) (service as any).queue.push({ title: "noise", category: "Bot", priority: "low" });
+    service.record({ title: "Mute Automatically Expired", category: "Moderation", priority: "critical" });
+    expect((service as any).queue.length).toBeLessThanOrEqual(100);
+  });
+  it("does not let delivery failure or shutdown flush failure escape the caller", async () => {
+    const service = new AuditLogService(logging, async (_input, init) => {
+      if (!init?.method) return ok({ guild_id: logging.guildId, channel_id: logging.channelId });
+      throw new Error("network unavailable");
+    });
+    await service.initialize();
+    service.record({ title: "Verification Enabled", category: "Verification" });
+    await expect(service.shutdown(10)).resolves.toBeUndefined();
+  });
+  it("does not retry permanent webhook rejections", async () => {
+    let posts = 0;
+    const service = new AuditLogService(logging, async (_input, init) => {
+      if (!init?.method) return ok({ guild_id: logging.guildId, channel_id: logging.channelId });
+      posts++; return new Response(null, { status: 400 });
+    });
+    await service.initialize();
+    service.record({ title: "Backup Created", category: "Backups" });
+    await (service as any).working;
+    expect(posts).toBe(1);
+  });
+  it("accepts the important event categories without treating them as Discord mentions", async () => {
+    const sent: unknown[] = [];
+    const service = new AuditLogService(logging, async (_input, init) => {
+      if (!init?.method) return ok({ guild_id: logging.guildId, channel_id: logging.channelId });
+      sent.push(JSON.parse(String(init.body))); return new Response(null, { status: 204 });
+    });
+    await service.initialize();
+    for (const [title, category] of [["Admin Configuration Changed", "Admin Configuration"], ["Embed Scheduled", "Embeds"], ["Manual Backup Created", "Backups"], ["Restore Completed With Warnings", "Backups"], ["Restore Failed", "Backups"]]) service.record({ title, category, guild: { id: "g", name: "Guild" } });
+    await (service as any).working;
+    expect(sent).toHaveLength(5);
+  });
 });
 
 describe("duration parsing", () => {
@@ -859,6 +976,25 @@ describe("guild backup persistence", () => {
       false,
     );
   });
+  it("groups restore warnings into compact operator-facing categories", () => {
+    expect(
+      groupRestoreWarnings([
+        "Managed integration roles were excluded.",
+        "Protected channel could not be deleted.",
+        "Role hierarchy exceeds Cookie's highest role.",
+        "Community feature is controlled by Discord.",
+        "An unsupported property was not captured.",
+        "A miscellaneous warning.",
+      ]).map(({ category, warnings }) => [category, warnings.length]),
+    ).toEqual([
+      ["Managed/integration roles", 1],
+      ["Protected channels", 1],
+      ["Hierarchy limitations", 1],
+      ["Discord-controlled guild features", 1],
+      ["Unsupported properties", 1],
+      ["Other", 1],
+    ]);
+  });
   it("restores zero system channel flags as an empty discord.js bitfield", () => {
     const resolved = systemChannelFlagsFromSnapshot("0");
     expect(resolved).toBeInstanceOf(SystemChannelFlagsBitField);
@@ -1256,6 +1392,103 @@ describe("guild backup persistence", () => {
     });
     expect(critical).toEqual([]);
   });
+  it("moves Community references before deleting a stale protected rules channel", async () => {
+    const repoMock = {
+      settings: async () => ({ ticket_category_id: null }),
+      autoroles: async () => ({}),
+      joinChannel: async () => null,
+      verification: async () => ({}),
+    } as any;
+    const service = new BackupService(repoMock, {} as any);
+    const channels = new Map<string, any>();
+    const guild: any = {
+      id: "destination",
+      features: ["COMMUNITY"],
+      rulesChannelId: "stale-about-us",
+      publicUpdatesChannelId: "stale-updates",
+      edit: async (payload: any) => {
+        guild.features = payload.features;
+        guild.rulesChannelId = payload.rulesChannel;
+        guild.publicUpdatesChannelId = payload.publicUpdatesChannel;
+      },
+      fetch: async () => guild,
+      roles: { everyone: { id: "destination" }, cache: new Map() },
+      members: { cache: new Map() },
+    };
+    const stale = {
+      id: "stale-about-us",
+      name: "📌 || about-us",
+      type: 0,
+      get deletable() {
+        return guild.rulesChannelId !== "stale-about-us";
+      },
+      delete: async () => channels.delete("stale-about-us"),
+      permissionOverwrites: { cache: new Map() },
+    };
+    const rules = {
+      id: "restored-rules",
+      name: "rules",
+      type: 0,
+      parentId: null,
+      permissionOverwrites: { cache: new Map() },
+    };
+    const updates = {
+      id: "restored-updates",
+      name: "updates",
+      type: 0,
+      parentId: null,
+      permissionOverwrites: { cache: new Map() },
+    };
+    channels.set(stale.id, stale);
+    channels.set(rules.id, rules);
+    channels.set(updates.id, updates);
+    guild.channels = { cache: channels };
+    const snapshot = {
+      guild: {
+        communityEnabled: true,
+        rulesChannelId: "source-rules",
+        publicUpdatesChannelId: "source-updates",
+      },
+      roles: [],
+      channels: [
+        { id: "source-rules", name: "rules", type: 0, parentId: null, overwrites: [] },
+        { id: "source-updates", name: "updates", type: 0, parentId: null, overwrites: [] },
+      ],
+    };
+    const channelMap = new Map([
+      ["source-rules", rules.id],
+      ["source-updates", updates.id],
+    ]);
+    const critical: string[] = [];
+    expect(stale.deletable).toBe(false);
+    await (service as any).restoreCommunity(
+      guild,
+      snapshot,
+      channelMap,
+      [],
+      critical,
+    );
+    expect(guild.rulesChannelId).toBe(rules.id);
+    expect(stale.deletable).toBe(true);
+    const unremovable = new Map<string, string>();
+    await (service as any).cleanupStaleChannels(
+      guild,
+      channelMap,
+      unremovable,
+      critical,
+    );
+    expect(channels.has(stale.id)).toBe(false);
+    await (service as any).finalValidate(
+      guild,
+      snapshot,
+      new Map(),
+      channelMap,
+      unremovable,
+      [],
+      critical,
+    );
+    expect(critical).toEqual([]);
+  });
   it("treats a post-restore overwrite mismatch as a critical final-validation failure", async () => {
     const r = {
       settings: async () => ({ ticket_category_id: null }),
@@ -1298,6 +1531,7 @@ describe("guild backup persistence", () => {
       },
       new Map([["source-everyone", "destination-everyone"]]),
       new Map([["source-channel", "destination-channel"]]),
+      new Map(),
       [],
       critical,
     );
@@ -1305,6 +1539,50 @@ describe("guild backup persistence", () => {
       expect.arrayContaining([
         "Final validation: permission overwrite count for general does not match its backup.",
         "Final validation: permission overwrite for general does not match its backup.",
+      ]),
+    );
+  });
+  it("flags stale ordinary roles, channels, and categories after reconstruction", async () => {
+    const service = new BackupService(
+      {
+        settings: async () => ({ ticket_category_id: null }),
+        autoroles: async () => ({}),
+        joinChannel: async () => null,
+        verification: async () => ({}),
+      } as any,
+      {} as any,
+    );
+    const everyone = { id: "guild", managed: false };
+    const critical: string[] = [];
+    await (service as any).finalValidate(
+      {
+        roles: {
+          everyone,
+          cache: new Map([
+            ["guild", everyone],
+            ["stale-role", { id: "stale-role", name: "Stale", managed: false }],
+          ]),
+        },
+        channels: {
+          cache: new Map([
+            ["stale-channel", { id: "stale-channel", name: "Stale channel", type: 0 }],
+            ["stale-category", { id: "stale-category", name: "Stale category", type: 4 }],
+          ]),
+        },
+        members: { cache: new Map() },
+        features: [],
+      },
+      { guild: { communityEnabled: undefined }, roles: [], channels: [] },
+      new Map(),
+      new Map(),
+      new Map(),
+      [],
+      critical,
+    );
+    expect(critical).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("unexpected ordinary role"),
+        expect.stringContaining("unexpected channel or categor"),
       ]),
     );
   });
@@ -1566,6 +1844,87 @@ describe("restore completion notifications and guild identity", () => {
     );
     expect(row.completion_dm_status).toBe("failed");
     expect(row.completion_dm_failure_reason).toContain("50007");
+  });
+  it("starts one restore progress DM and edits that same message into the final result", async () => {
+    const { r, backup } = await completionFixture();
+    const sent: any[] = [];
+    const edits: any[] = [];
+    const service = new BackupService(r, {
+      users: {
+        fetch: async () => ({
+          send: async (payload: any) => {
+            sent.push(payload);
+            return { edit: async (next: any) => edits.push(next) };
+          },
+        }),
+      },
+    } as any);
+    const startedAtMs = Date.now();
+    const progress = await (service as any).startRestoreProgressDm({
+      backup,
+      destination: { id: "destination", name: "Destination" },
+      userId: "admin",
+      restoreId: "restore",
+      startedAtMs,
+    });
+    await (service as any).updateRestoreProgressDm(progress, {
+      backup,
+      destination: { id: "destination", name: "Destination" },
+      phase: "Roles",
+      startedAtMs,
+      completed: 2,
+      total: 4,
+      force: true,
+      restoreId: "restore",
+    });
+    await (service as any).notifyCompletion({
+      restoreId: "restore",
+      backup,
+      snapshot: identitySnapshot,
+      destination: { id: "destination", name: "Destination" },
+      userId: "admin",
+      startedAt: new Date(startedAtMs).toISOString(),
+      result: result("completed"),
+      phase: "complete",
+      destructive: true,
+      progressDm: progress,
+    });
+    expect(sent).toHaveLength(1);
+    expect(sent[0].embeds[0].data.title).toBe("Server Restore Running");
+    expect(edits).toHaveLength(2);
+    expect(edits.at(-1).embeds[0].data.title).toBe("Server Restore Completed");
+  });
+  it("treats a disabled executor DM as observability-only", async () => {
+    const service = new BackupService(
+      {} as any,
+      {
+        users: {
+          fetch: async () => {
+            throw Object.assign(new Error("Cannot send messages to this user"), {
+              code: 50007,
+            });
+          },
+        },
+      } as any,
+    );
+    const backup = { backup_id: "backup", source_guild_name: "Source" } as any;
+    const progress = await (service as any).startRestoreProgressDm({
+      backup,
+      destination: { id: "destination", name: "Destination" },
+      userId: "admin",
+      restoreId: "restore",
+      startedAtMs: Date.now(),
+    });
+    await expect(
+      (service as any).updateRestoreProgressDm(progress, {
+        backup,
+        destination: { id: "destination", name: "Destination" },
+        phase: "Roles",
+        startedAtMs: Date.now(),
+        restoreId: "restore",
+      }),
+    ).resolves.toBeUndefined();
+    expect(progress.message).toBeUndefined();
   });
   it("maps guild identity channels and makes an absent icon authoritative", async () => {
     const edits: any[] = [];

@@ -14,9 +14,13 @@ try {
     if (shuttingDown) return;
     shuttingDown = true;
     logger.info("Cookie shutting down", { signal });
+    bot.audit.record({ title: "Cookie Shutting Down", category: "Bot", color: "warning", priority: "critical", details: { Signal: signal } });
+    for (const guildId of bot.backups.activeRestoreDestinations())
+      bot.audit.record({ title: "Restore Interrupted By Shutdown", category: "Backups", color: "danger", priority: "critical", guild: { id: guildId }, reason: `Cookie received ${signal}; durable restore state was left for operator review.` });
     bot.mutes.stop();
     bot.backups.stop();
     bot.embedScheduler.stop();
+    await bot.audit.shutdown();
     bot.client.destroy();
     await db.close();
     process.exit(exitCode);

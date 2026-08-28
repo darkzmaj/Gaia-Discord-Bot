@@ -1,5 +1,10 @@
 export type LogContext = Record<string, string | number | boolean | undefined>;
 
+const redact = (value: string): string =>
+  value
+    .replace(/(?:https?:\/\/[^\s/]+)?\/api\/webhooks\/\d{17,20}\/[A-Za-z0-9_\-.]+/gi, "[redacted webhook]")
+    .replace(/[A-Za-z\d_-]{20,}\.[A-Za-z\d_-]{6,}\.[A-Za-z\d_-]{20,}/g, "[redacted token]");
+
 function write(level: string, message: string, context: LogContext = {}): void {
   const safe = Object.fromEntries(
     Object.entries(context).filter(([, value]) => value !== undefined),
@@ -9,7 +14,7 @@ function write(level: string, message: string, context: LogContext = {}): void {
       timestamp: new Date().toISOString(),
       level,
       message,
-      ...safe,
+      ...Object.fromEntries(Object.entries(safe).map(([key, value]) => [key, typeof value === "string" ? redact(value) : value])),
     }),
   );
 }
@@ -50,6 +55,7 @@ export function logDiscordError(
       "unknown Discord REST failure",
   )
     .replace(/[\r\n]/g, " ")
+    .replace(/(?:https?:\/\/[^\s/]+)?\/api\/webhooks\/\d{17,20}\/[A-Za-z0-9_\-.]+/gi, "[redacted webhook]")
     .slice(0, 300);
   const stack =
     process.env.NODE_ENV === "production"
@@ -72,7 +78,7 @@ export function logDiscordError(
       typeof value?.route === "string"
         ? value.route
         : typeof value?.url === "string"
-          ? value.url.replace(/^https?:\/\/[^/]+/, "")
+          ? redact(value.url.replace(/^https?:\/\/[^/]+/, ""))
           : undefined,
     discordMessage: message,
     stack,
