@@ -1,6 +1,12 @@
-export interface Migration { version: number; sql: string }
+export interface Migration {
+  version: number;
+  sql: string;
+}
 
-export const migrations: Migration[] = [{ version: 1, sql: `
+export const migrations: Migration[] = [
+  {
+    version: 1,
+    sql: `
 CREATE TABLE guild_settings (
   guild_id TEXT PRIMARY KEY,
   autorole_enabled INTEGER NOT NULL DEFAULT 1 CHECK (autorole_enabled IN (0,1)),
@@ -78,9 +84,17 @@ CREATE TABLE global_embeds (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
-` }, { version: 2, sql: `
+`,
+  },
+  {
+    version: 2,
+    sql: `
 ALTER TABLE active_voice_rooms ADD COLUMN control_message_id TEXT;
-` }, { version: 3, sql: `
+`,
+  },
+  {
+    version: 3,
+    sql: `
 ALTER TABLE voice_room_preferences ADD COLUMN custom_name TEXT;
 ALTER TABLE global_embeds ADD COLUMN template_id TEXT;
 UPDATE global_embeds SET template_id=lower(hex(randomblob(16))) WHERE template_id IS NULL;
@@ -105,7 +119,11 @@ CREATE TABLE mute_channel_restorations (
   PRIMARY KEY(guild_id, user_id, channel_id)
 );
 CREATE INDEX idx_mute_channel_restorations_guild_user ON mute_channel_restorations(guild_id, user_id);
-` }, { version: 4, sql: `
+`,
+  },
+  {
+    version: 4,
+    sql: `
 CREATE TABLE verification_config (
   guild_id TEXT PRIMARY KEY REFERENCES guild_settings(guild_id) ON DELETE CASCADE,
   enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
@@ -118,7 +136,11 @@ CREATE TABLE verification_config (
   message_id TEXT,
   updated_at TEXT NOT NULL
 );
-` }, { version: 5, sql: `
+`,
+  },
+  {
+    version: 5,
+    sql: `
 CREATE TABLE guild_backup_settings (
   guild_id TEXT PRIMARY KEY,
   automatic_enabled INTEGER NOT NULL DEFAULT 0 CHECK(automatic_enabled IN (0,1)),
@@ -157,14 +179,22 @@ CREATE TABLE restore_operations (
   errors_json TEXT NOT NULL
 );
 CREATE INDEX idx_restore_operations_destination_status ON restore_operations(destination_guild_id, status);
-` }, { version: 6, sql: `
+`,
+  },
+  {
+    version: 6,
+    sql: `
 CREATE TABLE command_sync_state (
   application_id TEXT PRIMARY KEY,
   schema_fingerprint TEXT NOT NULL,
   guild_cleanup_complete INTEGER NOT NULL DEFAULT 0 CHECK(guild_cleanup_complete IN (0,1)),
   updated_at TEXT NOT NULL
 );
-` }, { version: 7, sql: `
+`,
+  },
+  {
+    version: 7,
+    sql: `
 -- SQLite cannot extend a CHECK constraint in place. Preserve every historical
 -- operation while adding the explicit terminal state for destructive restores.
 CREATE TABLE restore_operations_next (
@@ -185,7 +215,11 @@ FROM restore_operations;
 DROP TABLE restore_operations;
 ALTER TABLE restore_operations_next RENAME TO restore_operations;
 CREATE INDEX idx_restore_operations_destination_status ON restore_operations(destination_guild_id, status);
-` }, { version: 8, sql: `
+`,
+  },
+  {
+    version: 8,
+    sql: `
 CREATE TABLE global_embed_attachments (
   id TEXT PRIMARY KEY,
   template_id TEXT NOT NULL REFERENCES global_embeds(template_id) ON DELETE CASCADE,
@@ -222,7 +256,34 @@ CREATE TABLE scheduled_embed_sends (
 );
 CREATE INDEX idx_scheduled_embed_sends_due ON scheduled_embed_sends(status, scheduled_for_utc);
 CREATE INDEX idx_scheduled_embed_sends_guild_status ON scheduled_embed_sends(guild_id, status, scheduled_for_utc);
-` }, { version: 9, sql: `
+`,
+  },
+  {
+    version: 9,
+    sql: `
 ALTER TABLE scheduled_embed_sends ADD COLUMN mention_json TEXT NOT NULL DEFAULT '{"roles":[],"everyone":false,"here":false}';
 ALTER TABLE scheduled_embed_sends ADD COLUMN mention_outcome TEXT;
-` }];
+`,
+  },
+  {
+    version: 10,
+    sql: `
+ALTER TABLE restore_operations ADD COLUMN executor_user_id TEXT;
+ALTER TABLE restore_operations ADD COLUMN completion_dm_status TEXT NOT NULL DEFAULT 'pending' CHECK(completion_dm_status IN ('pending','attempting','sent','failed','not_applicable'));
+ALTER TABLE restore_operations ADD COLUMN completion_dm_attempted_at TEXT;
+ALTER TABLE restore_operations ADD COLUMN completion_dm_sent_at TEXT;
+ALTER TABLE restore_operations ADD COLUMN completion_dm_failure_reason TEXT;
+UPDATE restore_operations SET executor_user_id=requested_by WHERE executor_user_id IS NULL;
+CREATE TABLE guild_backup_assets (
+  backup_id TEXT NOT NULL REFERENCES guild_backups(backup_id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK(kind IN ('icon','banner','splash','discovery_splash')),
+  content_type TEXT NOT NULL,
+  size_bytes INTEGER NOT NULL CHECK(size_bytes > 0 AND size_bytes <= 8388608),
+  sha256 TEXT NOT NULL,
+  data BLOB NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(backup_id, kind)
+);
+`,
+  },
+];
