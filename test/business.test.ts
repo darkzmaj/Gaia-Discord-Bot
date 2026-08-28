@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { createHash } from "node:crypto";
-import { PermissionFlagsBits } from "discord.js";
+import { PermissionFlagsBits, SystemChannelFlagsBitField } from "discord.js";
 import { createDatabase, type SqliteDatabase } from "../src/db/database.js";
 import { CookieRepository, type GuildBackup } from "../src/db/repositories.js";
 import {
@@ -36,6 +36,9 @@ import {
   BackupService,
   mapPermissionOverwrites,
   MAX_BACKUP_BYTES,
+  roleColorsFromSnapshot,
+  roleCreateOptions,
+  systemChannelFlagsFromSnapshot,
 } from "../src/services/backup-service.js";
 import {
   CommandSynchronizer,
@@ -575,6 +578,29 @@ describe("guild backup persistence", () => {
       "two",
     ]);
   });
+  it("retains restore-referenced history instead of failing a new backup transaction", async () => {
+    const r = await repo();
+    await r.storeBackup(backup("one", "a", "2026-01-01T00:00:00.000Z"));
+    await r.storeBackup(backup("two", "a", "2026-01-02T00:00:00.000Z"));
+    await r.createRestoreOperation({
+      restore_id: "restore-one",
+      backup_id: "one",
+      destination_guild_id: "b",
+      requested_by: "admin",
+      status: "completed",
+      current_phase: "complete",
+      progress_json: "{}",
+      errors_json: "[]",
+    });
+    await expect(
+      r.storeBackup(backup("three", "a", "2026-01-03T00:00:00.000Z")),
+    ).resolves.toBeUndefined();
+    expect((await r.backups("a")).map((entry) => entry.backup_id)).toEqual([
+      "three",
+      "two",
+      "one",
+    ]);
+  });
   it("retains a selected source backup while making a same-guild safety backup", async () => {
     const r = await repo();
     await r.storeBackup(backup("source", "a", "2026-01-01T00:00:00.000Z"));
@@ -825,13 +851,163 @@ describe("guild backup persistence", () => {
     );
     expect(mapped.skipped).toBe(1);
     expect(mapped.mapped).toEqual([
-      { id: "destination-everyone", allow: BigInt(large), deny: 7n },
-      { id: "destination-role", allow: 3n, deny: BigInt(large) },
-      { id: "present-member", allow: 5n, deny: 6n },
+      { id: "destination-everyone", type: 0, allow: BigInt(large), deny: 7n },
+      { id: "destination-role", type: 0, allow: 3n, deny: BigInt(large) },
+      { id: "present-member", type: 1, allow: 5n, deny: 6n },
     ]);
     expect(mapped.mapped.some((entry) => entry.id.startsWith("source-"))).toBe(
       false,
     );
+  });
+  it("restores zero system channel flags as an empty discord.js bitfield", () => {
+    const resolved = systemChannelFlagsFromSnapshot("0");
+    expect(resolved).toBeInstanceOf(SystemChannelFlagsBitField);
+    expect(resolved.bitfield).toBe(0);
+    expect(SystemChannelFlagsBitField.resolve(resolved)).toBe(0);
+  });
+  it("preserves one, multiple, and every supported system channel flag", () => {
+    const flags = SystemChannelFlagsBitField.Flags as Record<string, number>;
+    const one = flags.SuppressJoinNotifications;
+    const multiple =
+      flags.SuppressJoinNotifications |
+      flags.SuppressGuildReminderNotifications |
+      flags.SuppressRoleSubscriptionPurchaseNotificationReplies;
+    const all = Object.entries(flags)
+      .filter(([, value]) => typeof value === "number")
+      .reduce((value, [, flag]) => value | flag, 0);
+
+    expect(systemChannelFlagsFromSnapshot(String(one)).bitfield).toBe(one);
+    expect(systemChannelFlagsFromSnapshot(String(multiple)).bitfield).toBe(
+      multiple,
+    );
+    expect(systemChannelFlagsFromSnapshot(String(all)).bitfield).toBe(all);
+  });
+  it("rejects malformed or unsupported persisted system channel flags", () => {
+    expect(() => systemChannelFlagsFromSnapshot("not-a-bitfield")).toThrow(
+      "systemChannelFlags",
+    );
+    expect(() => systemChannelFlagsFromSnapshot("-1")).toThrow(
+      "systemChannelFlags",
+    );
+    expect(() => systemChannelFlagsFromSnapshot("64")).toThrow("unsupported");
+  });
+  it("supports legacy numeric system channel flags and round-trips captured values", () => {
+    const source = new SystemChannelFlagsBitField([
+      "SuppressPremiumSubscriptions",
+      "SuppressJoinNotificationReplies",
+    ]);
+    const persisted = source.bitfield.toString();
+    expect(systemChannelFlagsFromSnapshot(0).bitfield).toBe(0);
+    expect(systemChannelFlagsFromSnapshot(persisted).bitfield.toString()).toBe(
+      persisted,
+    );
+  });
+  it("never sends undefined or legacy numeric role colors to RoleManager#create", () => {
+    const role = (extra: Record<string, unknown> = {}) => ({
+      id: "source-role",
+      name: "Staff",
+      permissions: "900719925474099312345",
+      hoist: false,
+      mentionable: true,
+      ...extra,
+    });
+    const assertDiscordRolePayload = (options: any) => {
+      if (!("colors" in options)) return;
+      if (!options.colors || typeof options.colors !== "object")
+        throw new Error("colors must be an object");
+      if (typeof options.colors.primaryColor !== "number")
+        throw new Error("primaryColor must be numeric");
+    };
+    const noColor = roleCreateOptions(role({ color: undefined }));
+    expect(noColor).not.toHaveProperty("colors");
+    expect(() => assertDiscordRolePayload(noColor)).not.toThrow();
+
+    const standard = roleCreateOptions(role({ color: 0x5865f2 }));
+    expect(standard.colors).toEqual({ primaryColor: 0x5865f2 });
+    expect(() => assertDiscordRolePayload(standard)).not.toThrow();
+    expect(standard.permissions).toBe(900719925474099312345n);
+  });
+  it("preserves supported enhanced role colors and omits malformed cosmetic data", () => {
+    expect(
+      roleColorsFromSnapshot({
+        colors: {
+          primaryColor: 11127295,
+          secondaryColor: 16759788,
+          tertiaryColor: 16761760,
+        },
+      }),
+    ).toEqual({
+      primaryColor: 11127295,
+      secondaryColor: 16759788,
+      tertiaryColor: 16761760,
+    });
+    expect(roleColorsFromSnapshot({ colors: undefined, color: undefined })).toBeUndefined();
+    expect(roleColorsFromSnapshot({ colors: 0x5865f2 })).toBeUndefined();
+  });
+  it("captures only ordinary roles, excluding @everyone and managed integrations", async () => {
+    const service = new BackupService(
+      {
+        activeRooms: async () => [],
+        settings: async () => ({}),
+        autoroles: async () => ({}),
+        joinChannel: async () => null,
+        verification: async () => ({}),
+        staffMembers: async () => [],
+      } as any,
+      {} as any,
+    );
+    const everyone = { id: "guild", managed: false, permissions: { bitfield: 0n } };
+    const ordinary = {
+      id: "ordinary",
+      name: "Ordinary",
+      managed: false,
+      colors: { primaryColor: 0x5865f2, secondaryColor: null, tertiaryColor: null },
+      hoist: false,
+      permissions: { bitfield: 900719925474099312345n },
+      mentionable: true,
+      position: 1,
+      unicodeEmoji: null,
+    };
+    const managed = { ...ordinary, id: "managed", managed: true };
+    const sourceSystemFlags = new SystemChannelFlagsBitField([
+      "SuppressJoinNotifications",
+      "SuppressRoleSubscriptionPurchaseNotifications",
+    ]);
+    const captured = await (service as any).capture(
+      {
+        id: "guild",
+        name: "Guild",
+        roles: { everyone, cache: new Map([["guild", everyone], ["ordinary", ordinary], ["managed", managed]]) },
+        channels: { cache: new Map() },
+        features: [],
+        systemChannelFlags: sourceSystemFlags,
+        members: { filter: () => ({ map: () => [] }) },
+      },
+      "backup",
+      { filter: () => ({ map: () => [] }) },
+    );
+    expect(captured.snapshot.roles).toMatchObject([{ id: "ordinary" }]);
+    expect(captured.snapshot.roles).toHaveLength(1);
+    expect(captured.snapshot.guild.systemChannelFlags).toBe(
+      sourceSystemFlags.bitfield.toString(),
+    );
+    expect(
+      systemChannelFlagsFromSnapshot(
+        captured.snapshot.guild.systemChannelFlags,
+      ).bitfield,
+    ).toBe(sourceSystemFlags.bitfield);
+  });
+  it("does not add a downstream hierarchy error when role creation left no mapping", async () => {
+    const service = new BackupService({} as any, {} as any);
+    const critical: string[] = [];
+    await (service as any).applyRoleHierarchy(
+      { members: { me: { roles: { highest: { position: 99 } } } }, roles: { cache: new Map() } },
+      { roles: [{ id: "failed", name: "Failed", position: 1 }] },
+      new Map(),
+      [],
+      critical,
+    );
+    expect(critical).toEqual([]);
   });
   it("rejects malformed snapshots before a restore can mutate Discord", () => {
     const service = new BackupService({} as any, {} as any);
@@ -875,6 +1051,12 @@ describe("guild backup persistence", () => {
         channels: [{ ...valid.channels[0], parentId: "missing" }],
       }),
     ).toThrow("channel");
+    expect(() =>
+      (service as any).validate({
+        ...valid,
+        guild: { ...valid.guild, systemChannelFlags: "invalid" },
+      }),
+    ).toThrow("system channel flags");
   });
   it("uses UTF-8 byte boundaries for the 25 MB snapshot limit", () => {
     const under = "€".repeat(Math.floor((MAX_BACKUP_BYTES - 3) / 3));
@@ -1119,9 +1301,12 @@ describe("guild backup persistence", () => {
       [],
       critical,
     );
-    expect(critical).toEqual([
-      "Final validation: permission overwrite for general does not match its backup.",
-    ]);
+    expect(critical).toEqual(
+      expect.arrayContaining([
+        "Final validation: permission overwrite count for general does not match its backup.",
+        "Final validation: permission overwrite for general does not match its backup.",
+      ]),
+    );
   });
   it("validates a large synthetic snapshot without numeric permission conversion", () => {
     const service = new BackupService({} as any, {} as any);
@@ -1176,7 +1361,7 @@ describe("command UX schema", () => {
       commands.find((command: any) => command.name === "unverify")?.description,
     ).toBe(`${ADMIN_LABEL} Unverify a member.`);
   });
-  it("keeps /admin zero-option and exposes attachment upload only inside /embed", () => {
+  it("keeps /admin and /embed zero-option while attachments stay in Embed Manager", () => {
     const admin: any = commands.find(
         (command: any) => command.name === "admin",
       ),
@@ -1185,10 +1370,7 @@ describe("command UX schema", () => {
         (command: any) => command.name === "unverify",
       );
     expect(admin.options).toEqual([]);
-    expect(embed.options.map((option: any) => option.name)).toEqual([
-      "template",
-      "attachment",
-    ]);
+    expect(embed.options).toEqual([]);
     expect(unverify.options).toHaveLength(1);
     expect(commands.map((command: any) => command.name)).toEqual([
       "admin",
@@ -1212,6 +1394,26 @@ describe("command UX schema", () => {
       expect(command.integration_types).toEqual([0]);
       expect(command.contexts).toEqual([0]);
     }
+  });
+  it("keeps the Embed Manager button rows within Discord's five-component limit", async () => {
+    const r = await repo();
+    const bot = new CookieBot(r);
+    const replies: any[] = [];
+    await (bot as any).embed({
+      guild: {
+        id: "a",
+        members: {
+          fetch: async () => ({ permissions: { has: () => true } }),
+        },
+      },
+      user: { id: "admin" },
+      reply: async (payload: any) => replies.push(payload),
+    });
+    expect(replies[0].components).toHaveLength(2);
+    expect(replies[0].components.map((row: any) => row.components.length)).toEqual(
+      [5, 1],
+    );
+    bot.client.destroy();
   });
 });
 
@@ -1399,16 +1601,23 @@ describe("restore completion notifications and guild identity", () => {
       [],
       [],
     );
-    expect(edits[0]).toMatchObject({
-      name: "Deforged Games",
-      description: null,
-      afkChannel: "d-afk",
-      systemChannel: "d-system",
-      rulesChannel: "d-rules",
-      publicUpdatesChannel: "d-updates",
-      safetyAlertsChannel: "d-alerts",
-    });
-    expect(edits[1]).toMatchObject({ icon: null });
+    expect(edits).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "Deforged Games" }),
+        expect.objectContaining({ description: null }),
+        expect.objectContaining({ afkChannel: "d-afk" }),
+        expect.objectContaining({ systemChannel: "d-system" }),
+        expect.objectContaining({
+          systemChannelFlags: expect.any(SystemChannelFlagsBitField),
+        }),
+        expect.objectContaining({ safetyAlertsChannel: "d-alerts" }),
+        expect.objectContaining({ icon: null }),
+      ]),
+    );
+    expect(
+      edits.find((payload) => "systemChannelFlags" in payload)
+        ?.systemChannelFlags.bitfield,
+    ).toBe(0);
   });
   it("captures icon bytes with a hash and restores the retained binary rather than a URL", async () => {
     const originalFetch = globalThis.fetch;

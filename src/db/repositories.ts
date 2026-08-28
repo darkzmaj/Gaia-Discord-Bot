@@ -1042,6 +1042,9 @@ export class CookieRepository {
     protectedBackupId?: string,
     assets: GuildBackupAsset[] = [],
   ): Promise<void> {
+    // Backups can be created before the guildCreate listener has finished.
+    // Establish the parent configuration row first so every related write is valid.
+    await this.ensureGuild(backup.source_guild_id);
     await this.db.exec("BEGIN IMMEDIATE");
     try {
       await this.db.run(
@@ -1094,7 +1097,8 @@ export class CookieRepository {
       for (const old of retained)
         if (!keep.has(old.backup_id))
           await this.db.run(
-            "DELETE FROM guild_backups WHERE backup_id=?",
+            "DELETE FROM guild_backups WHERE backup_id=? AND NOT EXISTS (SELECT 1 FROM restore_operations WHERE backup_id=?)",
+            old.backup_id,
             old.backup_id,
           );
       await this.db.exec("COMMIT");

@@ -5,6 +5,7 @@ import {
   ChannelSelectMenuBuilder,
   ChannelType,
   Client,
+  ComponentType,
   EmbedBuilder,
   GatewayIntentBits,
   MessageFlags,
@@ -336,26 +337,26 @@ export class CookieBot {
           interaction.isStringSelectMenu()) &&
         interaction.customId.startsWith("adminui:")
       )
-        return void this.adminUi.handleSelect(interaction);
+        return await this.adminUi.handleSelect(interaction);
       if (
         (interaction.isStringSelectMenu() ||
           interaction.isChannelSelectMenu() ||
           interaction.isRoleSelectMenu()) &&
         interaction.customId.startsWith("embedui:")
       )
-        return void this.handleEmbedUi(interaction);
+        return await this.handleEmbedUi(interaction);
       if (
         interaction.isUserSelectMenu() &&
         interaction.customId.startsWith("roompick:")
       )
-        return void this.rooms.handleUserSelect(interaction);
+        return await this.rooms.handleUserSelect(interaction);
       if (
         interaction.isStringSelectMenu() &&
         interaction.customId.startsWith("roomaccess:")
       )
-        return void this.rooms.handleStringSelect(interaction);
+        return await this.rooms.handleStringSelect(interaction);
       if (interaction.isAutocomplete())
-        return void this.handleAutocomplete(interaction);
+        return await this.handleAutocomplete(interaction);
       if (interaction.isChatInputCommand())
         await this.handleCommand(interaction);
     } catch (error) {
@@ -381,11 +382,11 @@ export class CookieBot {
   private async handleCommand(i: ChatInputCommandInteraction): Promise<void> {
     if (!i.inGuild())
       return void reply(i, "Cookie commands can only be used in a server.");
-    if (i.commandName === "admin") return void this.adminUi.open(i);
+    if (i.commandName === "admin") return await this.adminUi.open(i);
     if (i.commandName === "mute" || i.commandName === "unmute")
-      return void this.moderate(i);
-    if (i.commandName === "unverify") return void this.unverify(i);
-    if (i.commandName === "embed") return void this.embed(i);
+      return await this.moderate(i);
+    if (i.commandName === "unverify") return await this.unverify(i);
+    if (i.commandName === "embed") return await this.embed(i);
   }
   private async moderate(i: ChatInputCommandInteraction): Promise<void> {
     const moderator = await this.allowed(i, "staff");
@@ -488,8 +489,9 @@ export class CookieBot {
   private async embed(i: ChatInputCommandInteraction): Promise<void> {
     const actor = await this.allowed(i, "administrator");
     if (!actor || !i.guild) return;
-    const upload = i.options.getAttachment("attachment"),
-      requestedTemplate = i.options.getString("template");
+    // Attachments are intentionally managed from the Embed Manager modal, not slash options.
+    const upload: any = null,
+      requestedTemplate = null;
     if (upload) {
       const name = requestedTemplate;
       if (!name)
@@ -570,7 +572,7 @@ export class CookieBot {
           .setColor(color)
           .setTitle("Cookie Embed Manager")
           .setDescription(
-            "Global embeds are shared across every server using this Cookie instance.\n\nScheduled sends use the latest saved template at delivery time. Upload a file with `/embed template:<name> attachment:<file>`.",
+            "Global embeds are shared across every server using this Cookie instance.\n\nScheduled sends use the latest saved template at delivery time. Use **Attachments** to add, replace, or remove a saved file.",
           ),
       ],
       components: [
@@ -594,6 +596,12 @@ export class CookieBot {
           new ButtonBuilder()
             .setCustomId(`embedui:list:${i.guild.id}`)
             .setLabel("List")
+            .setStyle(ButtonStyle.Secondary),
+        ),
+        new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder()
+            .setCustomId(`embedui:attachments:${i.guild.id}`)
+            .setLabel("Attachments")
             .setStyle(ButtonStyle.Secondary),
         ),
       ],
@@ -938,6 +946,135 @@ export class CookieBot {
           : "No global embeds have been saved.",
         flags: MessageFlags.Ephemeral,
       });
+    }
+    if (i.isButton() && action === "attachments") {
+      const names = await this.repo.embeds(0, 25);
+      if (!names.length) return void reply(i, "Create an embed before adding attachments.");
+      return void i.reply({
+        content: "Select the saved embed whose attachments you want to manage.",
+        components: [
+          new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+            new StringSelectMenuBuilder()
+              .setCustomId(`embedui:attachmenttemplate:${i.guild.id}`)
+              .setPlaceholder("Select a global embed")
+              .addOptions(names.map((name) => ({ label: name, value: name }))),
+          ),
+        ],
+        flags: MessageFlags.Ephemeral,
+      });
+    }
+    if (i.isStringSelectMenu() && action === "attachmenttemplate") {
+      const template = await this.repo.embed(i.values[0]);
+      if (!template) return void reply(i, "That global embed no longer exists.");
+      const attachments = await this.repo.attachments(template.template_id);
+      return void i.update({
+        content: attachments.length
+          ? `**${template.name} attachments**\n${attachments.map((item) => `• ${item.filename} — ${(item.size_bytes / 1024).toFixed(1)} KB`).join("\n")}`
+          : `**${template.name}** has no stored attachments.`,
+        components: [
+          new ActionRowBuilder<ButtonBuilder>().addComponents(
+            new ButtonBuilder()
+              .setCustomId(`embedui:attachmentupload:${template.template_id}`)
+              .setLabel("Upload or Replace")
+              .setStyle(ButtonStyle.Primary),
+          ),
+          ...(attachments.length
+            ? [
+                new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+                  new StringSelectMenuBuilder()
+                    .setCustomId(
+                      `embedui:attachmentremove:${template.template_id}`,
+                    )
+                    .setPlaceholder("Remove an attachment")
+                    .addOptions(
+                      attachments.slice(0, 25).map((item) => ({
+                        label: item.filename,
+                        description: `${(item.size_bytes / 1024).toFixed(1)} KB`,
+                        value: item.filename,
+                      })),
+                    ),
+                ),
+              ]
+            : []),
+        ],
+      });
+      /*
+      return void i.showModal({
+        customId: `embedui:attachmentupload:${template.template_id}`,
+        title: `Upload attachment: ${template.name}`.slice(0, 45),
+        components: [
+          {
+            type: ComponentType.Label,
+            label: "Attachment",
+            description: "Uploading a same-named file replaces it.",
+            component: {
+              type: ComponentType.FileUpload,
+              customId: "attachment",
+              minValues: 1,
+              maxValues: 1,
+              required: true,
+            },
+          },
+        ],
+      } as any);
+      */
+    }
+    if (i.isButton() && action === "attachmentupload")
+      return void i.showModal({
+        customId: `embedui:attachmentupload:${tokenOrGuild}`,
+        title: "Upload embed attachment",
+        components: [
+          {
+            type: ComponentType.Label,
+            label: "Attachment",
+            description: "Uploading a same-named file replaces it.",
+            component: {
+              type: ComponentType.FileUpload,
+              customId: "attachment",
+              minValues: 1,
+              maxValues: 1,
+              required: true,
+            },
+          },
+        ],
+      } as any);
+    if (i.isModalSubmit() && action === "attachmentupload") {
+      const template = await this.repo.embedById(tokenOrGuild);
+      if (!template) return void reply(i, "That global embed no longer exists.");
+      const upload = i.fields.getUploadedFiles("attachment", true).first();
+      if (!upload) return void reply(i, "No attachment was received.");
+      if (upload.size > MAX_ATTACHMENT_BYTES)
+        return void reply(
+          i,
+          `Attachment exceeds the ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB limit.`,
+        );
+      try {
+        const response = await fetch(upload.url, {
+          signal: AbortSignal.timeout(15_000),
+        });
+        if (!response.ok) throw new Error("Discord attachment download failed.");
+        const data = Buffer.from(await response.arrayBuffer());
+        if (data.length !== upload.size)
+          throw new Error("Attachment size changed during upload.");
+        await this.repo.saveAttachment(
+          attachmentRecord(
+            template.template_id,
+            upload.name,
+            upload.contentType ?? "application/octet-stream",
+            data,
+            i.user.id,
+          ),
+        );
+        return void i.reply({
+          content: `Stored attachment **${upload.name}** on **${template.name}**. Use \`attachment://${upload.name}\` in embed image or thumbnail URLs.`,
+          flags: MessageFlags.Ephemeral,
+        });
+      } catch (error) {
+        return void reply(
+          i,
+          error instanceof Error ? error.message : "Attachment upload failed.",
+        );
+      }
     }
     if (i.isButton() && action === "create")
       return void i.showModal(

@@ -11,7 +11,7 @@ try {
   requireConfig();
   db = await createDatabase(config.databasePath);
   client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] });
-  const ready = once(client, 'ready');
+  const ready = once(client, 'clientReady');
   await client.login(config.token);
   await ready;
   const sync = new CommandSynchronizer(new CookieRepository(db), config.applicationId);

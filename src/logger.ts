@@ -32,14 +32,21 @@ export function logDiscordError(
   const value = error as {
     code?: unknown;
     status?: unknown;
+    method?: unknown;
+    url?: unknown;
+    route?: unknown;
     message?: unknown;
     stack?: unknown;
+    cause?: { code?: unknown; status?: unknown; message?: unknown };
     rawError?: { code?: unknown; message?: unknown };
   };
-  const code = value?.code ?? value?.rawError?.code;
+  const cause = value?.cause;
+  const code = value?.code ?? value?.rawError?.code ?? cause?.code;
   const message = String(
     value?.rawError?.message ??
       value?.message ??
+      cause?.message ??
+      (typeof error === "string" ? error : undefined) ??
       "unknown Discord REST failure",
   )
     .replace(/[\r\n]/g, " ")
@@ -53,7 +60,20 @@ export function logDiscordError(
   write("error", "[discord] operation failed", {
     operation,
     code: code === undefined ? undefined : String(code),
-    status: typeof value?.status === "number" ? value.status : undefined,
+    status:
+      typeof value?.status === "number"
+        ? value.status
+        : typeof cause?.status === "number"
+          ? cause.status
+          : undefined,
+    method:
+      typeof value?.method === "string" ? value.method : undefined,
+    route:
+      typeof value?.route === "string"
+        ? value.route
+        : typeof value?.url === "string"
+          ? value.url.replace(/^https?:\/\/[^/]+/, "")
+          : undefined,
     discordMessage: message,
     stack,
     ...context,

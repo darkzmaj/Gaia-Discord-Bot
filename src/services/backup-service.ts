@@ -3,6 +3,7 @@ import {
   ChannelType,
   EmbedBuilder,
   PermissionFlagsBits,
+  SystemChannelFlagsBitField,
   type Client,
   type Guild,
 } from "discord.js";
@@ -12,7 +13,7 @@ import type {
   GuildBackupAsset,
 } from "../db/repositories.js";
 import { KeyedLock } from "./locks.js";
-import { logger } from "../logger.js";
+import { logDiscordError, logger } from "../logger.js";
 import { isDiscordAdministrator } from "./authorization.js";
 
 export const BACKUP_SCHEMA_VERSION = 2;
@@ -56,7 +57,99 @@ export type SavedOverwrite = {
   allow: string;
   deny: string;
 };
-export type MappedOverwrite = { id: string; allow: bigint; deny: bigint };
+export type MappedOverwrite = {
+  id: string;
+  type: 0 | 1;
+  allow: bigint;
+  deny: bigint;
+};
+export type SavedRoleColors = {
+  primaryColor: number;
+  secondaryColor?: number | null;
+  tertiaryColor?: number | null;
+};
+
+const systemChannelFlagEntries = Object.entries(
+  SystemChannelFlagsBitField.Flags,
+).filter(([, value]) => typeof value === "number") as [
+  keyof typeof SystemChannelFlagsBitField.Flags & string,
+  number,
+][];
+const supportedSystemChannelFlagsMask = systemChannelFlagEntries.reduce(
+  (mask, [, value]) => mask | BigInt(value),
+  0n,
+);
+
+/**
+ * Backups use a decimal string for JSON safety. GuildEditOptions does not
+ * accept bigint system-channel flags, so resolve the snapshot to the exact
+ * discord.js bitfield type instead (including an empty bitfield for zero).
+ */
+export const systemChannelFlagsFromSnapshot = (
+  value: unknown,
+): SystemChannelFlagsBitField => {
+  const serialized =
+    typeof value === "string"
+      ? value
+      : typeof value === "number" && Number.isSafeInteger(value)
+        ? String(value)
+        : undefined;
+  if (!serialized || !/^\d+$/.test(serialized))
+    throw new Error("systemChannelFlags must be a non-negative decimal bitfield.");
+
+  const bitfield = BigInt(serialized);
+  if ((bitfield & ~supportedSystemChannelFlagsMask) !== 0n)
+    throw new Error(
+      "systemChannelFlags contains flags unsupported by this discord.js version.",
+    );
+
+  const flagNames = systemChannelFlagEntries
+    .filter(([, flag]) => (bitfield & BigInt(flag)) === BigInt(flag))
+    .map(([name]) => name);
+  return flagNames.length
+    ? new SystemChannelFlagsBitField(flagNames)
+    : new SystemChannelFlagsBitField();
+};
+
+const validRoleColor = (value: unknown): value is number =>
+  typeof value === "number" &&
+  Number.isInteger(value) &&
+  value >= 0 &&
+  value <= 0xffffff;
+
+/** Normalizes schema-v1 legacy `color` and schema-v2 enhanced role colors. */
+export const roleColorsFromSnapshot = (
+  saved: Record<string, unknown>,
+): SavedRoleColors | undefined => {
+  const enhanced = saved.colors as Record<string, unknown> | undefined;
+  const primary = enhanced?.primaryColor ?? saved.color;
+  if (!validRoleColor(primary)) return undefined;
+  const colors: SavedRoleColors = { primaryColor: primary };
+  for (const key of ["secondaryColor", "tertiaryColor"] as const) {
+    const value = enhanced?.[key];
+    if (value === null) colors[key] = null;
+    else if (validRoleColor(value)) colors[key] = value;
+  }
+  return colors;
+};
+
+export const roleCreateOptions = (saved: any, includeCosmetics = true): any => {
+  const options: any = {
+    name: saved.name,
+    hoist: saved.hoist === true,
+    permissions: BigInt(saved.permissions),
+    mentionable: saved.mentionable === true,
+    reason: "Cookie full backup restore",
+  };
+  if (!includeCosmetics) return options;
+  const colors = roleColorsFromSnapshot(saved);
+  if (colors) options.colors = colors;
+  if (typeof saved.unicodeEmoji === "string" && saved.unicodeEmoji.length)
+    options.unicodeEmoji = saved.unicodeEmoji;
+  if (typeof saved.iconUrl === "string" && saved.iconUrl.length)
+    options.icon = saved.iconUrl;
+  return options;
+};
 export type RestoreResult = {
   restoreId: string;
   status: "completed" | "completed_with_warnings" | "failed_partial" | "failed";
@@ -88,7 +181,12 @@ export const mapPermissionOverwrites = (
       return [];
     }
     return [
-      { id, allow: BigInt(overwrite.allow), deny: BigInt(overwrite.deny) },
+      {
+        id,
+        type: overwrite.type,
+        allow: BigInt(overwrite.allow),
+        deny: BigInt(overwrite.deny),
+      },
     ];
   });
   return { mapped, skipped };
@@ -129,10 +227,15 @@ const errorText = (error: unknown) => {
     code?: unknown;
     rawError?: { code?: unknown; message?: unknown };
     message?: unknown;
+    cause?: { code?: unknown; message?: unknown };
   };
-  const code = value?.code ?? value?.rawError?.code;
+  const code = value?.code ?? value?.rawError?.code ?? value?.cause?.code;
   const message = String(
-    value?.rawError?.message ?? value?.message ?? "unknown Discord error",
+    value?.rawError?.message ??
+      value?.message ??
+      value?.cause?.message ??
+      (typeof error === "string" ? error : undefined) ??
+      "unknown Discord error",
   )
     .replace(/[\r\n]/g, " ")
     .slice(0, 280);
@@ -157,6 +260,10 @@ export class BackupService {
   private readonly locks = new KeyedLock();
   private readonly activeRestores = new Set<string>();
   private readonly activeBackups = new Set<string>();
+  private readonly restoreDiagnostics = new Map<
+    string,
+    { restoreId: string; phase: string; operation?: string }
+  >();
   private readonly memberSyncs = new Map<
     string,
     Promise<{
@@ -174,6 +281,26 @@ export class BackupService {
     private readonly repo: CookieRepository,
     private readonly client: Client,
   ) {}
+
+  /** Logs the Discord REST failure before reducing it to a safe operator message. */
+  private restoreError(
+    guild: Guild,
+    operation: string,
+    error: unknown,
+    context: Record<string, string | number | boolean | undefined> = {},
+  ): string {
+    const diagnostic = this.restoreDiagnostics.get(guild.id);
+    if (diagnostic) diagnostic.operation = operation;
+    logDiscordError("backup.restore", error, {
+      service: "backup.restore",
+      restoreId: diagnostic?.restoreId,
+      phase: diagnostic?.phase,
+      operation,
+      guildId: guild.id,
+      ...context,
+    });
+    return errorText(error);
+  }
 
   start(): void {
     this.timer = setInterval(
@@ -507,8 +634,20 @@ export class BackupService {
     let phase = "safety backup",
       safetyBackupId: string | undefined,
       destructive = false;
+    const diagnostics: { restoreId: string; phase: string; operation?: string } = {
+      restoreId,
+      phase,
+    };
+    this.restoreDiagnostics.set(destination.id, diagnostics);
+    const setPhase = (next: string) => {
+      phase = next;
+      diagnostics.phase = next;
+    };
     const operation = () => ({
-      progress_json: progressJson(roleMap, channelMap, counts, safetyBackupId),
+      progress_json: JSON.stringify({
+        ...JSON.parse(progressJson(roleMap, channelMap, counts, safetyBackupId)),
+        lastOperation: diagnostics.operation,
+      }),
       errors_json: JSON.stringify([...warnings, ...criticalFailures]),
     });
     await this.repo.createRestoreOperation({
@@ -543,7 +682,7 @@ export class BackupService {
         current_phase: "destination cleanup",
         ...operation(),
       });
-      phase = "destination cleanup";
+      setPhase("destination cleanup");
       await report?.("Destructive cleanup begins");
       destructive = true;
       await this.deleteDestinationState(
@@ -554,7 +693,7 @@ export class BackupService {
       );
       this.throwIfCritical(criticalFailures);
 
-      phase = "roles";
+      setPhase("roles");
       await this.repo.updateRestoreOperation(restoreId, {
         current_phase: phase,
         ...operation(),
@@ -562,21 +701,43 @@ export class BackupService {
       await report?.("Roles", 0, snapshot.roles.length);
       for (let index = 0; index < snapshot.roles.length; index++) {
         const saved = snapshot.roles[index];
+        const colors = roleColorsFromSnapshot(saved);
+        const requestedCosmetics =
+          !!colors ||
+          (typeof saved.unicodeEmoji === "string" && saved.unicodeEmoji.length > 0) ||
+          (typeof saved.iconUrl === "string" && saved.iconUrl.length > 0);
+        if (("colors" in saved || "color" in saved) && !colors)
+          warnings.push(
+            `Role ${saved.name} (${saved.id}) has malformed or absent color metadata; its color was omitted rather than sending an invalid Discord payload.`,
+          );
         try {
-          const role = await destination.roles.create({
-            name: saved.name,
-            color: saved.color,
-            hoist: saved.hoist,
-            permissions: BigInt(saved.permissions),
-            mentionable: saved.mentionable,
-            unicodeEmoji: saved.unicodeEmoji ?? undefined,
-            reason: "Cookie full backup restore",
-          } as any);
+          let role: any;
+          try {
+            role = await destination.roles.create(roleCreateOptions(saved));
+          } catch (error) {
+            this.restoreError(destination, "role.create", error, {
+              roleId: saved.id,
+              roleName: saved.name,
+              attemptedCosmetics: requestedCosmetics,
+            });
+            if (!requestedCosmetics) throw error;
+            warnings.push(
+              `Role ${saved.name} (${saved.id}) rejected one or more cosmetic properties; retrying its required permissions and flags without cosmetics.`,
+            );
+            role = await destination.roles.create(
+              roleCreateOptions(saved, false),
+            );
+          }
           roleMap.set(saved.id, role.id);
           counts.roles++;
+          await this.repo.updateRestoreOperation(restoreId, operation());
         } catch (error) {
+          this.restoreError(destination, "role.create", error, {
+            roleId: saved.id,
+            roleName: saved.name,
+          });
           criticalFailures.push(
-            `Role ${saved.name} could not be created — ${errorText(error)}`,
+            `Role ${saved.name} (${saved.id}) could not be created — ${errorText(error)}`,
           );
         }
         if (index % 10 === 0 || index + 1 === snapshot.roles.length)
@@ -595,13 +756,16 @@ export class BackupService {
           "Cookie full backup restore",
         );
       } catch (error) {
+        this.restoreError(destination, "role.setPermissions", error, {
+          roleId: destination.roles.everyone.id,
+        });
         criticalFailures.push(
           `@everyone permissions could not be restored — ${errorText(error)}`,
         );
       }
       this.throwIfCritical(criticalFailures);
 
-      phase = "categories";
+      setPhase("categories");
       await this.repo.updateRestoreOperation(restoreId, {
         current_phase: phase,
         ...operation(),
@@ -617,8 +781,23 @@ export class BackupService {
         report,
         "Categories",
       );
+      const destinationMembers = await this.acquireMembers(destination);
+      await this.applyOverwrites(
+        destination,
+        snapshot.channels.filter(
+          (channel) => channel.type === ChannelType.GuildCategory,
+        ),
+        roleMap,
+        channelMap,
+        new Set(destinationMembers.members.keys()),
+        counts,
+        warnings,
+        criticalFailures,
+        report,
+      );
+      this.throwIfCritical(criticalFailures);
       // Community requires mapped Rules/Updates channels. Create ordinary channels first, then turn it on before announcement channels.
-      phase = "community prerequisites";
+      setPhase("community prerequisites");
       await this.repo.updateRestoreOperation(restoreId, {
         current_phase: phase,
         ...operation(),
@@ -647,7 +826,7 @@ export class BackupService {
         criticalFailures,
       );
       this.throwIfCritical(criticalFailures);
-      phase = "announcement channels";
+      setPhase("announcement channels");
       await this.repo.updateRestoreOperation(restoreId, {
         current_phase: phase,
         ...operation(),
@@ -672,23 +851,26 @@ export class BackupService {
       );
       this.throwIfCritical(criticalFailures);
 
-      phase = "permission overwrites";
+      setPhase("permission overwrites");
       await this.repo.updateRestoreOperation(restoreId, {
         current_phase: phase,
         ...operation(),
       });
       await this.applyOverwrites(
         destination,
-        snapshot,
+        snapshot.channels.filter(
+          (channel) => channel.type !== ChannelType.GuildCategory,
+        ),
         roleMap,
         channelMap,
+        new Set(destinationMembers.members.keys()),
         counts,
         warnings,
         criticalFailures,
         report,
       );
       this.throwIfCritical(criticalFailures);
-      phase = "member roles";
+      setPhase("member roles");
       await this.repo.updateRestoreOperation(restoreId, {
         current_phase: phase,
         ...operation(),
@@ -701,7 +883,7 @@ export class BackupService {
         warnings,
         report,
       );
-      phase = "guild settings";
+      setPhase("guild settings");
       await this.repo.updateRestoreOperation(restoreId, {
         current_phase: phase,
         ...operation(),
@@ -716,7 +898,7 @@ export class BackupService {
         criticalFailures,
       );
       this.throwIfCritical(criticalFailures);
-      phase = "Cookie configuration";
+      setPhase("Cookie configuration");
       await report?.("Cookie Configuration");
       await this.restoreCookieConfig(
         destination,
@@ -726,7 +908,7 @@ export class BackupService {
         warnings,
         userId,
       );
-      phase = "final validation";
+      setPhase("final validation");
       await this.repo.updateRestoreOperation(restoreId, {
         current_phase: phase,
         ...operation(),
@@ -836,6 +1018,8 @@ export class BackupService {
         failure: error,
       });
       throw error;
+    } finally {
+      this.restoreDiagnostics.delete(destination.id);
     }
   }
 
@@ -1038,6 +1222,9 @@ export class BackupService {
           "Cookie full backup restore: authoritative destination cleanup",
         );
       } catch (error) {
+        this.restoreError(guild, "channel.delete", error, {
+          channelId: channel.id,
+        });
         critical.push(
           `Destination channel ${channel.name} could not be deleted — ${errorText(error)}`,
         );
@@ -1087,8 +1274,11 @@ export class BackupService {
         ? guild.roles.cache.get(roleMap.get(saved.id)!)
         : undefined;
       if (!role) {
+        // The creation failure above is the authoritative error; do not obscure it
+        // with a second, downstream "unavailable" hierarchy failure.
+        if (!roleMap.has(saved.id)) continue;
         critical.push(
-          `Role hierarchy for ${saved.name} cannot be restored because the role is unavailable.`,
+          `Role hierarchy for ${saved.name} (${saved.id}) cannot be restored because its mapped destination role is unavailable.`,
         );
         continue;
       }
@@ -1142,6 +1332,9 @@ export class BackupService {
         channelMap.set(saved.id, channel.id);
         counts.channels++;
       } catch (error) {
+        this.restoreError(guild, "channel.create", error, {
+          channelId: saved.id,
+        });
         critical.push(
           `Channel ${saved.name} could not be created — ${errorText(error)}`,
         );
@@ -1187,6 +1380,7 @@ export class BackupService {
         reason: "Cookie full backup restore: Community state",
       } as any);
     } catch (error) {
+      this.restoreError(guild, "guild.edit", error, { field: "community" });
       const message = `Community source ${sourceCommunity ? "enabled" : "disabled"} could not be applied — ${errorText(error)}`;
       if (sourceCommunity) critical.push(message);
       else warnings.push(message);
@@ -1222,23 +1416,22 @@ export class BackupService {
   }
   private async applyOverwrites(
     guild: Guild,
-    snapshot: Snapshot,
+    savedChannels: any[],
     roleMap: Map<string, string>,
     channelMap: Map<string, string>,
+    memberIds: Set<string>,
     counts: Record<string, number>,
     warnings: string[],
     critical: string[],
     report?: RestoreProgress,
   ): Promise<void> {
-    await guild.members.fetch().catch(() => undefined);
-    const memberIds = new Set(guild.members.cache.keys());
-    const total = snapshot.channels.reduce(
+    const total = savedChannels.reduce(
       (value, channel) => value + channel.overwrites.length,
       0,
     );
     let complete = 0;
     await report?.("Permissions", 0, total);
-    for (const saved of snapshot.channels) {
+    for (const saved of savedChannels) {
       const channel: any = channelMap.has(saved.id)
         ? guild.channels.cache.get(channelMap.get(saved.id)!)
         : undefined;
@@ -1257,23 +1450,38 @@ export class BackupService {
         warnings.push(
           `${mapped.skipped} member-specific permission target${mapped.skipped === 1 ? "" : "s"} for ${saved.name} is no longer in the destination and was skipped.`,
         );
-      for (const overwrite of mapped.mapped) {
-        try {
-          await channel.permissionOverwrites.edit(
-            overwrite.id,
-            { allow: overwrite.allow, deny: overwrite.deny },
-            { reason: "Cookie full backup restore" },
+      try {
+        if (saved.permissionSync && saved.parentId)
+          await channel.lockPermissions(
+            "Cookie full backup restore: sync category permissions",
           );
-          counts.overwrites++;
-        } catch (error) {
-          critical.push(
+        else
+          await channel.permissionOverwrites.set(
+            mapped.mapped.map((overwrite) => ({
+              id: overwrite.id,
+              type: overwrite.type,
+              allow: overwrite.allow,
+              deny: overwrite.deny,
+            })),
+            "Cookie full backup restore: authoritative overwrite replacement",
+          );
+        counts.overwrites += mapped.mapped.length;
+      } catch (error) {
+        this.restoreError(
+          guild,
+          saved.permissionSync && saved.parentId
+            ? "channel.lockPermissions"
+            : "channel.permissionOverwrites.set",
+          error,
+          { channelId: channel.id },
+        );
+        critical.push(
             `Permission overwrite for ${saved.name} could not be restored — ${errorText(error)}`,
           );
-        }
-        complete++;
-        if (complete % 20 === 0 || complete === total)
-          await report?.("Permissions", complete, total);
       }
+      complete += saved.overwrites.length;
+      if (complete % 20 === 0 || complete === total)
+        await report?.("Permissions", complete, total);
     }
   }
   private async replaceMemberRoles(
@@ -1335,6 +1543,62 @@ export class BackupService {
     const setting = snapshot.guild;
     const mapped = (id: string | null | undefined) =>
       id ? (channelMap.get(id) ?? null) : null;
+    const apply = async (
+      field: string,
+      value: Record<string, unknown>,
+      optional = false,
+    ) => {
+      try {
+        await guild.edit({
+          ...value,
+          reason: `Cookie full backup restore: guild setting ${field}`,
+        } as any);
+      } catch (error) {
+        const detail = this.restoreError(guild, "guild.edit", error, { field });
+        const message = `Guild setting ${field} could not be restored: ${detail}`;
+        if (optional) warnings.push(message);
+        else critical.push(message);
+      }
+    };
+    await apply("name", { name: setting.name });
+    if ("description" in setting)
+      await apply("description", { description: setting.description });
+    for (const field of [
+      "verificationLevel",
+      "explicitContentFilter",
+      "defaultMessageNotifications",
+      "afkTimeout",
+    ])
+      if (field in setting) await apply(field, { [field]: setting[field] });
+    if ("afkChannelId" in setting)
+      await apply("afkChannel", { afkChannel: mapped(setting.afkChannelId) });
+    if ("systemChannelId" in setting)
+      await apply("systemChannel", {
+        systemChannel: mapped(setting.systemChannelId),
+      });
+    if ("systemChannelFlags" in setting)
+      await apply("systemChannelFlags", {
+        systemChannelFlags: systemChannelFlagsFromSnapshot(
+          setting.systemChannelFlags,
+        ),
+      });
+    if ("safetyAlertsChannelId" in setting)
+      await apply(
+        "safetyAlertsChannel",
+        { safetyAlertsChannel: mapped(setting.safetyAlertsChannelId) },
+        true,
+      );
+    if ("preferredLocale" in setting)
+      await apply("preferredLocale", { preferredLocale: setting.preferredLocale });
+    if ("premiumProgressBarEnabled" in setting)
+      await apply(
+        "premiumProgressBarEnabled",
+        { premiumProgressBarEnabled: setting.premiumProgressBarEnabled },
+        true,
+      );
+    await this.restoreGuildAssets(guild, setting, assets, warnings, critical);
+    return;
+    /*
     const payload: any = {
       name: setting.name,
       verificationLevel: setting.verificationLevel,
@@ -1349,7 +1613,7 @@ export class BackupService {
     if ("systemChannelId" in setting)
       payload.systemChannel = mapped(setting.systemChannelId);
     if ("systemChannelFlags" in setting)
-      payload.systemChannelFlags = BigInt(setting.systemChannelFlags);
+      payload.systemChannelFlags = systemChannelFlagsFromSnapshot(setting.systemChannelFlags);
     if ("rulesChannelId" in setting)
       payload.rulesChannel = mapped(setting.rulesChannelId);
     if ("publicUpdatesChannelId" in setting)
@@ -1368,6 +1632,7 @@ export class BackupService {
       );
     }
     await this.restoreGuildAssets(guild, setting, assets, warnings, critical);
+    */
   }
 
   private async restoreGuildAssets(
@@ -1406,6 +1671,7 @@ export class BackupService {
           reason: "Cookie full backup restore: guild identity asset",
         } as any);
       } catch (error) {
+        this.restoreError(guild, "guild.edit", error, { field: key });
         const detail = `${kind.replace("_", " ")} could not be restored — ${errorText(error)}`;
         if (kind === "icon") critical.push(detail);
         else
@@ -1432,11 +1698,22 @@ export class BackupService {
       .map((role) => ({
         id: role.id,
         name: role.name,
-        color: role.color,
+        colors: validRoleColor(role.colors?.primaryColor)
+          ? {
+              primaryColor: role.colors.primaryColor,
+              secondaryColor: validRoleColor(role.colors.secondaryColor)
+                ? role.colors.secondaryColor
+                : null,
+              tertiaryColor: validRoleColor(role.colors.tertiaryColor)
+                ? role.colors.tertiaryColor
+                : null,
+            }
+          : undefined,
         hoist: role.hoist,
         permissions: role.permissions.bitfield.toString(),
         mentionable: role.mentionable,
         position: role.position,
+        iconUrl: (role as any).iconURL?.({ size: 4096 }) ?? null,
         unicodeEmoji: role.unicodeEmoji ?? null,
       }));
     const unsupported: string[] = managedRoles.length
@@ -1491,6 +1768,8 @@ export class BackupService {
           type: channel.type,
           name: channel.name,
           parentId: channel.parentId,
+          permissionSync:
+            channel.parentId ? channel.permissionsLocked === true : false,
           position: channel.position,
           topic: channel.topic ?? null,
           nsfw: channel.nsfw ?? false,
@@ -1699,6 +1978,13 @@ export class BackupService {
       throw new Error("Backup snapshot schema is invalid.");
     if (!/^\d+$/.test(String(snapshot.guild.everyonePermissions ?? "0")))
       throw new Error("Backup snapshot permissions are invalid.");
+    if ("systemChannelFlags" in snapshot.guild) {
+      try {
+        systemChannelFlagsFromSnapshot(snapshot.guild.systemChannelFlags);
+      } catch {
+        throw new Error("Backup snapshot system channel flags are invalid.");
+      }
+    }
     const roleIds = new Set<string>();
     for (const role of snapshot.roles) {
       if (
@@ -1792,25 +2078,28 @@ export class BackupService {
     const forum =
       saved.type === ChannelType.GuildForum ||
       saved.type === ChannelType.GuildMedia;
-    const options: any = {
-      name: saved.name,
-      parent: parentId,
-      topic: saved.topic ?? undefined,
-      nsfw: saved.nsfw,
-      rateLimitPerUser: saved.rateLimitPerUser,
-      bitrate: saved.bitrate ?? undefined,
-      userLimit: saved.userLimit ?? undefined,
-      rtcRegion: saved.rtcRegion ?? undefined,
-    };
+    const options: any = { name: saved.name };
+    if (parentId !== undefined) options.parent = parentId;
+    for (const key of [
+      "topic",
+      "nsfw",
+      "rateLimitPerUser",
+      "bitrate",
+      "userLimit",
+      "rtcRegion",
+    ])
+      if (saved[key] !== null && saved[key] !== undefined)
+        options[key] = saved[key];
     if (forum)
-      Object.assign(options, {
-        defaultThreadRateLimitPerUser:
-          saved.defaultThreadRateLimitPerUser ?? undefined,
-        availableTags: saved.availableTags ?? undefined,
-        defaultReactionEmoji: saved.defaultReactionEmoji ?? undefined,
-        defaultSortOrder: saved.defaultSortOrder ?? undefined,
-        defaultForumLayout: saved.defaultForumLayout ?? undefined,
-      });
+      for (const key of [
+        "defaultThreadRateLimitPerUser",
+        "availableTags",
+        "defaultReactionEmoji",
+        "defaultSortOrder",
+        "defaultForumLayout",
+      ])
+        if (saved[key] !== null && saved[key] !== undefined)
+          options[key] = saved[key];
     return options;
   }
   private async restoreCookieConfig(
@@ -1982,10 +2271,34 @@ export class BackupService {
         roleMap,
         new Set(destination.members.cache.keys()),
       ).mapped;
+      const actualOverwrites = [
+        ...(channel.permissionOverwrites?.cache.values?.() ?? []),
+      ];
+      if (actualOverwrites.length !== expected.length)
+        critical.push(
+          `Final validation: permission overwrite count for ${saved.name} does not match its backup.`,
+        );
+      if (
+        saved.permissionSync &&
+        saved.parentId &&
+        channel.permissionsLocked !== true
+      )
+        critical.push(
+          `Final validation: channel ${saved.name} should be permission-synced with its category.`,
+        );
+      if (
+        !saved.permissionSync &&
+        saved.parentId &&
+        channel.permissionsLocked === true
+      )
+        critical.push(
+          `Final validation: channel ${saved.name} should retain custom permission overwrites.`,
+        );
       for (const overwrite of expected) {
         const actual = channel.permissionOverwrites?.cache.get(overwrite.id);
         if (
           !actual ||
+          actual.type !== overwrite.type ||
           actual.allow.bitfield !== overwrite.allow ||
           actual.deny.bitfield !== overwrite.deny
         )
