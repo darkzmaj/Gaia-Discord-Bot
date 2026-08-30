@@ -53,6 +53,10 @@ import {
   sanitizeAuditText,
   validateAuditLogConfig,
 } from "../src/services/audit-log-service.js";
+import {
+  MemberLogService,
+  validateMemberLogConfig,
+} from "../src/services/member-log-service.js";
 
 const databases: SqliteDatabase[] = [];
 async function repo(): Promise<CookieRepository> {
@@ -172,6 +176,109 @@ describe("production audit logging", () => {
     for (const [title, category] of [["Admin Configuration Changed", "Admin Configuration"], ["Embed Scheduled", "Embeds"], ["Manual Backup Created", "Backups"], ["Restore Completed With Warnings", "Backups"], ["Restore Failed", "Backups"]]) service.record({ title, category, guild: { id: "g", name: "Guild" } });
     await (service as any).working;
     expect(sent).toHaveLength(5);
+  });
+});
+
+describe("centralized member logging", () => {
+  const logging = {
+    webhookUrl: "https://discord.com/api/webhooks/123456789012345678/abcdefghijklmnopqrstuvwxyz",
+    channelId: "1481921183464030358",
+  };
+  const ok = (body: object = {}) => new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+  const member = (overrides: Partial<any> = {}) => {
+    const value: any = {
+      id: "123456789012345678",
+      guild: { id: "987654321098765432", name: "Example Server" },
+      user: { id: "123456789012345678", username: "dark", bot: false },
+      ...overrides,
+    };
+    value.user.displayAvatarURL = (options: unknown) => {
+      value.avatarOptions = options;
+      return "https://cdn.discordapp.com/embed/avatars/0.png";
+    };
+    return value;
+  };
+  const payloadFor = async (kind: "join" | "leave", value = member()) => {
+    const calls: Array<{ input: string; init?: RequestInit }> = [];
+    const service = new MemberLogService(logging, async (input, init) => {
+      calls.push({ input, init });
+      return init?.method ? new Response(null, { status: 204 }) : ok({ channel_id: logging.channelId });
+    });
+    await service.initialize();
+    const time = new Date("2026-08-30T12:34:56.000Z");
+    if (kind === "join") service.recordJoin(value as any, time);
+    else service.recordLeave(value as any, time);
+    await (service as any).working;
+    return { payload: JSON.parse(String(calls[1].init?.body)), service, time };
+  };
+  it("safely disables absent, invalid, and mismatched member webhook configuration", async () => {
+    expect(validateMemberLogConfig({})).toMatchObject({ enabled: false, reason: "not configured" });
+    expect(validateMemberLogConfig({ channelId: logging.channelId })).toMatchObject({ enabled: false, reason: "incomplete configuration" });
+    expect(validateMemberLogConfig({ ...logging, webhookUrl: "https://example.com/not-a-webhook" })).toMatchObject({ enabled: false, reason: "invalid webhook URL" });
+    const service = new MemberLogService(logging, async () => ok({ channel_id: "999999999999999999" }));
+    await expect(service.initialize()).resolves.toBeUndefined();
+    expect(service.enabled).toBe(false);
+  });
+  it("sends a green no-ping join embed with the actual event timestamp and avatar", async () => {
+    const value = member();
+    const { payload, time } = await payloadFor("join", value);
+    const embed = payload.embeds[0];
+    expect(embed.title).toBe("Member Joined");
+    expect(embed.color).toBe(0x57f287);
+    expect(embed.fields).toEqual(expect.arrayContaining([
+      { name: "User", value: "<@123456789012345678> (dark)", inline: false },
+      { name: "Guild", value: "Example Server", inline: false },
+      { name: "Joined", value: `<t:${Math.floor(time.getTime() / 1000)}:F>`, inline: false },
+      { name: "User ID", value: "123456789012345678", inline: true },
+      { name: "Guild ID", value: "987654321098765432", inline: true },
+    ]));
+    expect(embed.thumbnail.url).toContain("embed/avatars/0.png");
+    expect(value.avatarOptions).toEqual({ extension: "png", size: 4096, forceStatic: false });
+    expect(payload.allowed_mentions).toEqual({ parse: [], users: [], roles: [], replied_user: false });
+  });
+  it("sends a red no-ping leave embed with the member's normal username", async () => {
+    const { payload, time } = await payloadFor("leave");
+    const embed = payload.embeds[0];
+    expect(embed.title).toBe("Member Left");
+    expect(embed.color).toBe(0xed4245);
+    expect(embed.fields).toEqual(expect.arrayContaining([
+      { name: "User", value: "<@123456789012345678> (dark)", inline: false },
+      { name: "Left", value: `<t:${Math.floor(time.getTime() / 1000)}:F>`, inline: false },
+    ]));
+  });
+  it("ignores bot joins and leaves, including before a webhook request", async () => {
+    let calls = 0;
+    const service = new MemberLogService(logging, async () => { calls++; return ok({ channel_id: logging.channelId }); });
+    await service.initialize();
+    service.recordJoin(member({ user: { ...member().user, bot: true } }) as any);
+    service.recordLeave(member({ user: { ...member().user, bot: true } }) as any);
+    expect(calls).toBe(1);
+  });
+  it("contains transient delivery failures and retries through webhook-only access", async () => {
+    let posts = 0;
+    const service = new MemberLogService(logging, async (_input, init) => {
+      if (!init?.method) return ok({ channel_id: logging.channelId });
+      posts++;
+      if (posts === 1) throw new Error("network unavailable");
+      return new Response(null, { status: 204 });
+    });
+    await service.initialize();
+    expect(() => service.recordJoin(member() as any)).not.toThrow();
+    await (service as any).working;
+    expect(posts).toBe(2);
+  });
+  it("registers member logging beside the existing join handler", async () => {
+    const r = await repo();
+    const bot = new CookieBot(r);
+    let existingJoin = 0;
+    let recordedJoin = 0;
+    (bot as any).onMemberAdd = async () => { existingJoin++; };
+    (bot as any).memberLog = { recordJoin: () => { recordedJoin++; }, recordLeave: () => undefined };
+    bot.client.emit("guildMemberAdd", member() as any);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(existingJoin).toBe(1);
+    expect(recordedJoin).toBe(1);
+    bot.client.destroy();
   });
 });
 
@@ -1658,7 +1765,7 @@ describe("command UX schema", () => {
       "unverify",
     ]);
   });
-  it("uses Discord Administrator visibility only for administrator commands and guild-install contexts for all commands", () => {
+  it("uses Discord default permissions to hide restricted commands from unauthorized members", () => {
     const byName = new Map(
       commands.map((command: any) => [command.name, command]),
     );
@@ -1667,7 +1774,9 @@ describe("command UX schema", () => {
         PermissionFlagsBits.Administrator.toString(),
       );
     for (const name of ["mute", "unmute"])
-      expect(byName.get(name)?.default_member_permissions).toBeUndefined();
+      expect(byName.get(name)?.default_member_permissions).toBe(
+        PermissionFlagsBits.ModerateMembers.toString(),
+      );
     for (const command of commands as any[]) {
       expect(command.integration_types).toEqual([0]);
       expect(command.contexts).toEqual([0]);

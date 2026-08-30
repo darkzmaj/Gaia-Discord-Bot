@@ -1,11 +1,16 @@
 import 'dotenv/config';
 import { validateAuditLogConfig } from "./services/audit-log-service.js";
+import { validateMemberLogConfig } from "./services/member-log-service.js";
 
 const optionalEnv = (value: string | undefined): string | undefined => value?.trim();
 const auditLogging = {
   webhookUrl: optionalEnv(process.env.LOG_WEBHOOK_URL),
   guildId: optionalEnv(process.env.LOG_GUILD),
   channelId: optionalEnv(process.env.LOG_GUILD_CHANNEL),
+};
+const memberLogging = {
+  webhookUrl: optionalEnv(process.env.MEMBER_LOG_WEBHOOK_URL),
+  channelId: optionalEnv(process.env.MEMBER_LOG_CHANNEL),
 };
 
 export const config = {
@@ -15,6 +20,8 @@ export const config = {
   logLevel: process.env.LOG_LEVEL ?? 'info',
   auditLogging,
   auditLoggingValidation: validateAuditLogConfig(auditLogging),
+  memberLogging,
+  memberLoggingValidation: validateMemberLogConfig(memberLogging),
 };
 
 export function requireConfig(): void {

@@ -20,7 +20,7 @@ try {
     bot.mutes.stop();
     bot.backups.stop();
     bot.embedScheduler.stop();
-    await bot.audit.shutdown();
+    await Promise.all([bot.audit.shutdown(), bot.memberLog.shutdown()]);
     bot.client.destroy();
     await db.close();
     process.exit(exitCode);

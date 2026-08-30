@@ -51,6 +51,7 @@ import { BackupService } from "./services/backup-service.js";
 import { logDiscordError, logger } from "./logger.js";
 import { CommandSynchronizer } from "./services/command-sync.js";
 import { AuditLogService } from "./services/audit-log-service.js";
+import { MemberLogService } from "./services/member-log-service.js";
 import { config } from "./config.js";
 
 const color = 0xd9a066;
@@ -81,6 +82,7 @@ export class CookieBot {
   readonly backups: BackupService;
   readonly embedScheduler: EmbedScheduler;
   readonly audit: AuditLogService;
+  readonly memberLog: MemberLogService;
   private readonly commandSync: CommandSynchronizer;
   private startedAt = Date.now();
   private readonly pendingEmbeds = new Map<
@@ -121,6 +123,7 @@ export class CookieBot {
     applicationId?: string,
   ) {
     this.audit = new AuditLogService(config.auditLogging, fetch, config.auditLoggingValidation);
+    this.memberLog = new MemberLogService(config.memberLogging, fetch, config.memberLoggingValidation);
     this.mutes = new MuteService(repo, () => this.client.guilds.cache.values(), this.audit);
     this.rooms = new VoiceRoomService(repo);
     this.verification = new VerificationService(repo, this.audit);
@@ -198,6 +201,8 @@ export class CookieBot {
           }),
         ),
     );
+    this.client.on("guildMemberAdd", (member) => this.memberLog.recordJoin(member));
+    this.client.on("guildMemberRemove", (member) => this.memberLog.recordLeave(member));
     this.client.on(
       "voiceStateUpdate",
       (oldState, newState) =>
@@ -272,6 +277,11 @@ export class CookieBot {
     // Webhook destination validation is observability-only and never affects startup.
     void this.audit.initialize().catch((error) =>
       logger.warn("[logging] audit initialization failed safely", {
+        error: error instanceof Error ? error.name : "unknown",
+      }),
+    );
+    void this.memberLog.initialize().catch((error) =>
+      logger.warn("[member-logging] initialization failed safely", {
         error: error instanceof Error ? error.name : "unknown",
       }),
     );
