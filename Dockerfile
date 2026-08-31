@@ -5,10 +5,11 @@
 ######################################################################################
 FROM node:20-alpine AS base
 WORKDIR /app
-ENV NODE_ENV=production
 
 ######################################################################################
 # Dependencies (includes devDependencies, needed to compile TS and native modules)
+# NOTE: NODE_ENV must NOT be "production" here — npm treats that as a signal to skip
+# devDependencies (typescript, tsx, ...), which breaks `npm run build`.
 ######################################################################################
 FROM base AS deps
 # python3/make/g++ are required to build the sqlite3 native addon on alpine (musl)
