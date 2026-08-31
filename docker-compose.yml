@@ -1,0 +1,43 @@
+services:
+  cookie:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cookie-discord-bot:latest
+    container_name: cookie-discord-bot
+    restart: unless-stopped
+    environment:
+      DISCORD_TOKEN: ${DISCORD_TOKEN}
+      DATABASE_PATH: /app/data/cookie.sqlite
+      APPLICATION_ID: ${APPLICATION_ID}
+      DIAGNOSTIC_GUILD_ID: ${DIAGNOSTIC_GUILD_ID}
+      DIAGNOSTIC_USER_ID: ${DIAGNOSTIC_USER_ID}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LOG_GUILD: ${LOG_GUILD}
+      LOG_GUILD_CHANNEL: ${LOG_GUILD_CHANNEL}
+      MEMBER_LOG_CHANNEL: ${MEMBER_LOG_CHANNEL}
+      LOG_WEBHOOK_URL: ${LOG_WEBHOOK_URL}
+      MEMBER_LOG_WEBHOOK_URL: ${MEMBER_LOG_WEBHOOK_URL}
+    volumes:
+      - cookie-data:/app/data
+    # No inbound ports: this is an outbound-only Discord gateway connection.
+    # No meaningful process-external healthcheck exists for a gateway-only bot;
+    # `restart: unless-stopped` recovers from crashes via the container exiting.
+    # Security hardening
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+        reservations:
+          memory: 128M
+
+volumes:
+  cookie-data:
