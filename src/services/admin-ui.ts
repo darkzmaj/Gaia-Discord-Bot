@@ -33,6 +33,20 @@ import { logDiscordError } from "../logger.js";
 import type { AuditLogService } from "./audit-log-service.js";
 
 const color = 0xd9a066;
+
+/** Members whose role state would actually change: holders for remove, non-holders for add. */
+export function roleChangeTargets(
+  members: Iterable<any>,
+  mode: string,
+  roleId: string,
+  target: "user" | "everyone" | "bots",
+): any[] {
+  return [...members].filter(
+    (member) =>
+      (target !== "bots" || member.user.bot) &&
+      member.roles.cache.has(roleId) === (mode === "remove"),
+  );
+}
 type DeploymentSession = { guildId: string; userId: string; channelId: string };
 
 export class AdminUi {
@@ -352,6 +366,97 @@ export class AdminUi {
     }
     if (kind === "pick")
       return void await i.update(await this.picker(i.guild, action));
+    if (kind === "rolemgmt" && (action === "add" || action === "remove"))
+      return void await i.update({
+        content: `Select the role to ${action}.`,
+        embeds: [],
+        components: [
+          new ActionRowBuilder<RoleSelectMenuBuilder>().addComponents(
+            new RoleSelectMenuBuilder()
+              .setCustomId(`adminui:rmrole:${action}:${i.guild.id}`)
+              .setPlaceholder("Select a role"),
+          ),
+          new ActionRowBuilder<ButtonBuilder>().addComponents(
+            this.nav("roles", i.guild.id, "← Back"),
+          ),
+        ],
+      });
+    if (kind === "rmtarget" || kind === "rmapply") {
+      const [mode, roleId, target] = action.split("-");
+      const role = await this.managedRole(i, mode, roleId);
+      if (!role) return;
+      const verb = mode === "add" ? "Add" : "Remove",
+        preposition = mode === "add" ? "to" : "from";
+      if (kind === "rmtarget" && target === "user")
+        return void await i.update({
+          content: `Select the member to ${mode} <@&${role.id}> ${preposition}.`,
+          embeds: [],
+          components: [
+            new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(
+              new UserSelectMenuBuilder()
+                .setCustomId(`adminui:rmuser:${mode}-${role.id}:${i.guild.id}`)
+                .setPlaceholder("Select a member"),
+            ),
+            new ActionRowBuilder<ButtonBuilder>().addComponents(
+              this.nav("roles", i.guild.id, "Cancel", ButtonStyle.Secondary),
+            ),
+          ],
+        });
+      if (target !== "everyone" && target !== "bots") return;
+      const group = target === "bots" ? "bot" : "member";
+      if (kind === "rmtarget") {
+        const count = roleChangeTargets(
+          (await i.guild.members.fetch()).values(),
+          mode,
+          role.id,
+          target,
+        ).length;
+        return void await i.update({
+          content: count
+            ? `${verb} <@&${role.id}> ${preposition} **${count}** ${group}${count === 1 ? "" : "s"}? This cannot be undone automatically.`
+            : `No ${group}s need this change.`,
+          embeds: [],
+          components: [
+            new ActionRowBuilder<ButtonBuilder>().addComponents(
+              new ButtonBuilder()
+                .setCustomId(`adminui:rmapply:${action}:${i.guild.id}`)
+                .setLabel(`Confirm ${verb}`)
+                .setStyle(mode === "add" ? ButtonStyle.Success : ButtonStyle.Danger)
+                .setDisabled(!count),
+              this.nav("roles", i.guild.id, "Cancel", ButtonStyle.Secondary),
+            ),
+          ],
+        });
+      }
+      await i.deferUpdate();
+      // Clearing the components first stops a second click from starting a parallel run.
+      await i.editReply({ content: `🟡 ${verb === "Add" ? "Adding" : "Removing"} <@&${role.id}>…`, embeds: [], components: [] });
+      const members = roleChangeTargets(
+        (await i.guild.members.fetch()).values(),
+        mode,
+        role.id,
+        target,
+      );
+      const result = await this.applyRole(i, role, mode, members, target === "bots" ? "All bots" : "Everyone");
+      // shortcut: one final edit; very large servers can outlive the 15-minute interaction token, the audit record still lands.
+      await i
+        .editReply({
+          content: this.roleResult(verb, role.id, preposition, group, result),
+          components: [
+            new ActionRowBuilder<ButtonBuilder>().addComponents(
+              this.nav("roles", i.guild.id, "← Back"),
+            ),
+          ],
+        })
+        .catch((error: unknown) =>
+          logDiscordError("roles.bulk.editReply", error, {
+            service: "role-management",
+            guildId: i.guild.id,
+            interactionId: i.id,
+            customId: i.customId,
+          }),
+        );
+    }
   }
 
   async handleSelect(i: any) {
@@ -363,6 +468,55 @@ export class AdminUi {
         flags: MessageFlags.Ephemeral,
       });
     const id = i.values[0];
+    if (kind === "rmrole") {
+      const role = await this.managedRole(i, action, id);
+      if (!role) return;
+      const target = (key: string, label: string) =>
+        new ButtonBuilder()
+          .setCustomId(`adminui:rmtarget:${action}-${role.id}-${key}:${i.guild.id}`)
+          .setLabel(label)
+          .setStyle(ButtonStyle.Primary);
+      return void await i.update({
+        content: `${action === "add" ? "Add" : "Remove"} <@&${role.id}> ${action === "add" ? "to" : "from"} whom?`,
+        embeds: [],
+        components: [
+          new ActionRowBuilder<ButtonBuilder>().addComponents(
+            target("user", "Specific User"),
+            target("everyone", "Everyone"),
+            target("bots", "All Bots"),
+            this.nav("roles", i.guild.id, "Cancel", ButtonStyle.Secondary),
+          ),
+        ],
+      });
+    }
+    if (kind === "rmuser") {
+      const [mode, roleId] = action.split("-");
+      const role = await this.managedRole(i, mode, roleId);
+      if (!role) return;
+      const member = await i.guild.members.fetch(id).catch(() => null);
+      if (!member)
+        return void await i.reply({
+          content: "That user is not a member of this server.",
+          flags: MessageFlags.Ephemeral,
+        });
+      const verb = mode === "add" ? "Add" : "Remove",
+        preposition = mode === "add" ? "to" : "from";
+      const back = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        this.nav("roles", i.guild.id, "← Back"),
+      );
+      if (!roleChangeTargets([member], mode, role.id, "user").length)
+        return void await i.update({
+          content: `🟡 <@${member.id}> ${mode === "add" ? "already has" : "does not have"} <@&${role.id}>.`,
+          embeds: [],
+          components: [back],
+        });
+      const result = await this.applyRole(i, role, mode, [member], `<@${member.id}>`);
+      return void await i.update({
+        content: this.roleResult(verb, role.id, preposition, "member", result),
+        embeds: [],
+        components: [back],
+      });
+    }
     if (kind === "backupselect") {
       try {
         const preview = await this.backups.preview(id, i.guild, i.user.id);
@@ -774,6 +928,7 @@ export class AdminUi {
         ),
         new ActionRowBuilder<ButtonBuilder>().addComponents(
           this.nav("backups", guild.id, "Backups"),
+          this.nav("roles", guild.id, "Remove/Add Roles"),
           this.nav("dashboard", guild.id, "Refresh", ButtonStyle.Secondary),
         ),
       ],
@@ -782,6 +937,31 @@ export class AdminUi {
 
   private async view(guild: any, section: string): Promise<any> {
     if (section === "dashboard") return this.dashboard(guild);
+    if (section === "roles")
+      return {
+        content: "",
+        embeds: [
+          new EmbedBuilder()
+            .setColor(color)
+            .setTitle("Remove/Add Roles")
+            .setDescription(
+              "Add or remove a role for a specific member, everyone, or all bots in this server.\n\nCookie can only manage roles below its own highest role, and you can only manage roles below yours.",
+            ),
+        ],
+        components: [
+          new ActionRowBuilder<ButtonBuilder>().addComponents(
+            new ButtonBuilder()
+              .setCustomId(`adminui:rolemgmt:add:${guild.id}`)
+              .setLabel("Add Role")
+              .setStyle(ButtonStyle.Success),
+            new ButtonBuilder()
+              .setCustomId(`adminui:rolemgmt:remove:${guild.id}`)
+              .setLabel("Remove Role")
+              .setStyle(ButtonStyle.Danger),
+            this.nav("dashboard", guild.id, "← Back"),
+          ),
+        ],
+      };
     const s = await this.repo.settings(guild.id);
     if (section === "autorole") {
       const r = await this.repo.autoroles(guild.id);
@@ -1282,6 +1462,70 @@ export class AdminUi {
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(disabled);
   }
+  /** Rechecked on every step: the role, Cookie's hierarchy and the actor's hierarchy can change between clicks. */
+  private async managedRole(i: any, mode: string, roleId: string) {
+    const fail = async (content: string) => {
+      await i.reply({ content, flags: MessageFlags.Ephemeral });
+      return null;
+    };
+    if (mode !== "add" && mode !== "remove") return fail("Unknown role action.");
+    const role = i.guild.roles.cache.get(roleId);
+    if (!role || role.id === i.guild.id)
+      return fail("That role no longer exists or cannot be assigned.");
+    if (!this.verification.assignable(i.guild, role))
+      return fail(
+        "Cookie cannot use that role. Check Manage Roles, role hierarchy, and that it is not an integration role.",
+      );
+    const actor = await i.guild.members.fetch(i.user.id).catch(() => null);
+    if (
+      i.guild.ownerId !== i.user.id &&
+      !(actor && actor.roles.highest.comparePositionTo(role) > 0)
+    )
+      return fail("You can only manage roles below your own highest role.");
+    return role;
+  }
+
+  private async applyRole(i: any, role: any, mode: string, members: any[], target: string) {
+    let changed = 0;
+    const failed: string[] = [];
+    const reason = `Cookie role management by ${i.user.tag ?? i.user.id}`;
+    for (const member of members)
+      await (mode === "add"
+        ? member.roles.add(role, reason)
+        : member.roles.remove(role, reason)
+      ).then(
+        () => changed++,
+        (error: unknown) => {
+          failed.push(member.id);
+          logDiscordError(`roles.${mode}`, error, {
+            service: "role-management",
+            guildId: i.guild.id,
+            userId: member.id,
+          });
+        },
+      );
+    this.audit?.record({
+      title: mode === "add" ? "Role Added" : "Role Removed",
+      category: "Role Management",
+      color: failed.length ? "danger" : "warning",
+      guild: { id: i.guild.id, name: i.guild.name },
+      actor: { id: i.user.id, name: i.user.tag },
+      details: { Role: role.name, Target: target, Changed: changed, Failed: failed.length },
+    });
+    return { changed, failed };
+  }
+
+  private roleResult(
+    verb: string,
+    roleId: string,
+    preposition: string,
+    group: string,
+    result: { changed: number; failed: string[] },
+  ) {
+    const past = verb === "Add" ? "Added" : "Removed";
+    return `${result.failed.length ? "🟡" : "🟢"} ${past} <@&${roleId}> ${preposition} ${result.changed} ${group}${result.changed === 1 ? "" : "s"}.${result.failed.length ? `\n🔴 Failed for ${result.failed.length}: ${result.failed.slice(0, 10).map((id) => `<@${id}>`).join(" ")}` : ""}`;
+  }
+
   private sectionFor(key: string) {
     return key === "autorole_enabled"
       ? "autorole"

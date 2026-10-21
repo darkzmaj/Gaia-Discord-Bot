@@ -2757,3 +2757,199 @@ describe("global embeds", () => {
     bot.client.destroy();
   });
 });
+
+describe("admin role management", () => {
+  const roleAt = (id: string, position: number) => ({
+    id,
+    name: `role-${id}`,
+    position,
+    comparePositionTo: (other: any) => position - other.position,
+  });
+  const fixture = (options: { actorPosition?: number; assignable?: boolean; failFor?: string } = {}) => {
+    const role = roleAt("r1", 5);
+    const calls: string[] = [];
+    const memberWith = (id: string, bot: boolean, roles: string[]) => {
+      const held = new Set(roles);
+      return {
+        id,
+        user: { bot },
+        permissions: { has: () => true },
+        roles: {
+          cache: held,
+          highest: roleAt(`top-${id}`, id === "admin" ? (options.actorPosition ?? 10) : 1),
+          add: async (r: any) => {
+            if (id === options.failFor) throw new Error("Missing Permissions");
+            calls.push(`add:${id}`);
+            held.add(r.id);
+          },
+          remove: async (r: any) => {
+            calls.push(`remove:${id}`);
+            held.delete(r.id);
+          },
+        },
+      };
+    };
+    const members = new Map(
+      [
+        memberWith("admin", false, []),
+        memberWith("human1", false, []),
+        memberWith("human2", false, ["r1"]),
+        memberWith("bot1", true, ["r1"]),
+        memberWith("bot2", true, []),
+      ].map((m) => [m.id, m]),
+    );
+    const guild = {
+      id: "a",
+      name: "Guild",
+      ownerId: "owner",
+      roles: { cache: new Map<string, any>([["r1", role], ["a", roleAt("a", 0)]]) },
+      members: {
+        fetch: async (id?: string) => {
+          if (id === undefined) return members;
+          const member = members.get(id);
+          if (!member) throw new Error("Unknown Member");
+          return member;
+        },
+      },
+    };
+    const audits: any[] = [];
+    const ui = new AdminUi(
+      {} as any,
+      {} as any,
+      {} as any,
+      { assignable: () => options.assignable ?? true } as any,
+      {} as any,
+      () => "0s",
+      { record: (event: any) => audits.push(event) } as any,
+    );
+    const interact = (customId: string, values?: string[]) => {
+      const out = { updates: [] as any[], replies: [] as any[], edits: [] as any[] };
+      const interaction = {
+        id: "i1",
+        customId,
+        values,
+        guild,
+        user: { id: "admin", tag: "admin#0" },
+        update: async (payload: any) => void out.updates.push(payload),
+        reply: async (payload: any) => void out.replies.push(payload),
+        deferUpdate: async () => undefined,
+        editReply: async (payload: any) => void out.edits.push(payload),
+      };
+      return { interaction, out };
+    };
+    return { ui, calls, members, audits, interact };
+  };
+  const ids = (payload: any) =>
+    payload.components.flatMap((row: any) => row.components.map((c: any) => c.data.custom_id));
+
+  it("shows a single Remove/Add Roles entry on the dashboard that opens add and remove choices", async () => {
+    const r = await repo();
+    const { interact } = fixture();
+    const ui = new AdminUi(r, {} as any, {} as any, {} as any, {} as any, () => "0s");
+    const open = interact("");
+    await ui.open(open.interaction as any);
+    expect(ids(open.out.replies[0])).toContain("adminui:nav:roles:a");
+    const nav = interact("adminui:nav:roles:a");
+    await ui.handle(nav.interaction as any);
+    expect(ids(nav.out.updates[0])).toEqual([
+      "adminui:rolemgmt:add:a",
+      "adminui:rolemgmt:remove:a",
+      "adminui:nav:dashboard:a",
+    ]);
+  });
+
+  it("walks add → role → target and offers user, everyone and bots", async () => {
+    const { ui, interact } = fixture();
+    const pick = interact("adminui:rolemgmt:add:a");
+    await ui.handle(pick.interaction as any);
+    expect(ids(pick.out.updates[0])[0]).toBe("adminui:rmrole:add:a");
+    const select = interact("adminui:rmrole:add:a", ["r1"]);
+    await ui.handleSelect(select.interaction as any);
+    expect(ids(select.out.updates[0])).toEqual([
+      "adminui:rmtarget:add-r1-user:a",
+      "adminui:rmtarget:add-r1-everyone:a",
+      "adminui:rmtarget:add-r1-bots:a",
+      "adminui:nav:roles:a",
+    ]);
+  });
+
+  it("adds a role to everyone who lacks it after confirmation", async () => {
+    const { ui, calls, members, audits, interact } = fixture();
+    const confirm = interact("adminui:rmtarget:add-r1-everyone:a");
+    await ui.handle(confirm.interaction as any);
+    expect(confirm.out.updates[0].content).toContain("**3** members");
+    expect(calls).toEqual([]);
+    const apply = interact("adminui:rmapply:add-r1-everyone:a");
+    await ui.handle(apply.interaction as any);
+    expect(calls.sort()).toEqual(["add:admin", "add:bot2", "add:human1"]);
+    expect([...members.values()].every((m) => m.roles.cache.has("r1"))).toBe(true);
+    expect(apply.out.edits[0].components).toEqual([]);
+    expect(apply.out.edits.at(-1).content).toContain("Added <@&r1> to 3 members");
+    expect(audits[0]).toMatchObject({ title: "Role Added", details: { Target: "Everyone", Changed: 3, Failed: 0 } });
+  });
+
+  it("removes a role only from bots that hold it", async () => {
+    const { ui, calls, interact } = fixture();
+    const confirm = interact("adminui:rmtarget:remove-r1-bots:a");
+    await ui.handle(confirm.interaction as any);
+    expect(confirm.out.updates[0].content).toContain("**1** bot?");
+    await ui.handle(interact("adminui:rmapply:remove-r1-bots:a").interaction as any);
+    expect(calls).toEqual(["remove:bot1"]);
+  });
+
+  it("adds or removes a role for a specific user and skips no-op changes", async () => {
+    const { ui, calls, interact } = fixture();
+    const target = interact("adminui:rmtarget:add-r1-user:a");
+    await ui.handle(target.interaction as any);
+    expect(ids(target.out.updates[0])[0]).toBe("adminui:rmuser:add-r1:a");
+    const add = interact("adminui:rmuser:add-r1:a", ["human1"]);
+    await ui.handleSelect(add.interaction as any);
+    expect(add.out.updates[0].content).toContain("Added <@&r1> to 1 member.");
+    const again = interact("adminui:rmuser:add-r1:a", ["human1"]);
+    await ui.handleSelect(again.interaction as any);
+    expect(again.out.updates[0].content).toContain("already has");
+    const remove = interact("adminui:rmuser:remove-r1:a", ["human2"]);
+    await ui.handleSelect(remove.interaction as any);
+    expect(calls).toEqual(["add:human1", "remove:human2"]);
+    const missing = interact("adminui:rmuser:add-r1:a", ["ghost"]);
+    await ui.handleSelect(missing.interaction as any);
+    expect(missing.out.replies[0].content).toContain("not a member");
+  });
+
+  it("reports per-member failures without stopping the run", async () => {
+    const { ui, calls, audits, interact } = fixture({ failFor: "human1" });
+    const apply = interact("adminui:rmapply:add-r1-everyone:a");
+    await ui.handle(apply.interaction as any);
+    expect(calls.sort()).toEqual(["add:admin", "add:bot2"]);
+    expect(apply.out.edits.at(-1).content).toContain("Failed for 1: <@human1>");
+    expect(audits[0]).toMatchObject({ color: "danger", details: { Changed: 2, Failed: 1 } });
+  });
+
+  it("refuses @everyone, unassignable roles and roles at or above the actor", async () => {
+    const cases: [Parameters<typeof fixture>[0], string, string[] | undefined, string][] = [
+      [{}, "adminui:rmrole:add:a", ["a"], "cannot be assigned"],
+      [{ assignable: false }, "adminui:rmrole:add:a", ["r1"], "Cookie cannot use that role"],
+      [{ actorPosition: 5 }, "adminui:rmrole:add:a", ["r1"], "below your own highest role"],
+      [{ actorPosition: 5 }, "adminui:rmapply:add-r1-everyone:a", undefined, "below your own highest role"],
+      [{}, "adminui:rmapply:grant-r1-everyone:a", undefined, "Unknown role action"],
+    ];
+    for (const [options, customId, values, message] of cases) {
+      const { ui, calls, interact } = fixture(options);
+      const step = interact(customId, values);
+      if (values) await ui.handleSelect(step.interaction as any);
+      else await ui.handle(step.interaction as any);
+      expect(step.out.replies[0].content).toContain(message);
+      expect(step.out.updates).toEqual([]);
+      expect(calls).toEqual([]);
+    }
+  });
+
+  it("rejects role management once Administrator permission is gone", async () => {
+    const { ui, calls, members, interact } = fixture();
+    members.get("admin")!.permissions.has = () => false;
+    const step = interact("adminui:rmapply:add-r1-everyone:a");
+    await ui.handle(step.interaction as any);
+    expect(step.out.replies[0].content).toContain("Administrator");
+    expect(calls).toEqual([]);
+  });
+});
