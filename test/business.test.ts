@@ -2798,13 +2798,18 @@ describe("admin role management", () => {
         memberWith("bot2", true, []),
       ].map((m) => [m.id, m]),
     );
+    let fullFetches = 0;
     const guild = {
       id: "a",
       name: "Guild",
       ownerId: "owner",
       roles: { cache: new Map<string, any>([["r1", role], ["a", roleAt("a", 0)]]) },
       members: {
+        cache: members,
         fetch: async (id?: string) => {
+          // Mirrors Discord: a second full member request within 30s is rejected.
+          if (id === undefined && fullFetches++)
+            throw new Error("Request with opcode 8 was rate limited. Retry after 29.5 seconds.");
           if (id === undefined) return members;
           const member = members.get(id);
           if (!member) throw new Error("Unknown Member");

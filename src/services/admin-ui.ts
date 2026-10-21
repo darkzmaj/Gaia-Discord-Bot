@@ -406,7 +406,7 @@ export class AdminUi {
       const group = target === "bots" ? "bot" : "member";
       if (kind === "rmtarget") {
         const count = roleChangeTargets(
-          (await i.guild.members.fetch()).values(),
+          await this.allMembers(i.guild),
           mode,
           role.id,
           target,
@@ -432,7 +432,7 @@ export class AdminUi {
       // Clearing the components first stops a second click from starting a parallel run.
       await i.editReply({ content: `🟡 ${verb === "Add" ? "Adding" : "Removing"} <@&${role.id}>…`, embeds: [], components: [] });
       const members = roleChangeTargets(
-        (await i.guild.members.fetch()).values(),
+        await this.allMembers(i.guild),
         mode,
         role.id,
         target,
@@ -1483,6 +1483,21 @@ export class AdminUi {
     )
       return fail("You can only manage roles below your own highest role.");
     return role;
+  }
+
+  /** Discord allows one full member request (opcode 8) per guild about every 30s; a rate limit means a fetch just
+   * filled the cache, which the GuildMembers intent keeps current, so the cache is the same dataset. */
+  private async allMembers(guild: any) {
+    try {
+      return (await guild.members.fetch()).values();
+    } catch (error: any) {
+      if (
+        !String(error?.name ?? "").includes("GatewayRateLimit") &&
+        !String(error?.message ?? "").includes("opcode 8")
+      )
+        throw error;
+      return guild.members.cache.values();
+    }
   }
 
   private async applyRole(i: any, role: any, mode: string, members: any[], target: string) {
