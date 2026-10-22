@@ -8,8 +8,10 @@ import {
   type ButtonInteraction,
   type Guild,
   type GuildBasedChannel,
+  type Message,
   type Role,
 } from "discord.js";
+import { isDiscordAdministrator } from "./authorization.js";
 import type {
   CookieRepository,
   VerificationConfig,
@@ -23,9 +25,46 @@ export const normalizeVerificationColor = (input: string): number | null => {
   return /^[0-9a-fA-F]{6}$/.test(value) ? Number.parseInt(value, 16) : null;
 };
 
+// shortcut: one rejoin link for every guild Cookie is in; make it a per-guild setting if Cookie serves other communities.
+export const HONEYPOT_REJOIN_URL = "https://darkdragon.dev/discord";
+
 export class VerificationService {
   private readonly locks = new KeyedLock();
+  private readonly honeypotKicks = new Set<string>();
   constructor(private readonly repo: CookieRepository, private readonly audit?: AuditLogService) {}
+
+  /** The verification channel is a honeypot: humans only press the button, so any member message there is a spam bot. */
+  async honeypot(message: Message): Promise<void> {
+    if (!message.inGuild() || message.author.bot || message.webhookId || message.system) return;
+    const config = await this.repo.verification(message.guild.id);
+    if (!config.channel_id || message.channelId !== config.channel_id) return;
+    const member =
+      message.member ??
+      (await message.guild.members.fetch(message.author.id).catch(() => null));
+    if (!member || isDiscordAdministrator(member)) return;
+    await message.delete().catch(() => undefined);
+    const key = `${message.guild.id}:${member.id}`;
+    // Spam bots post bursts; kick and DM once per burst.
+    if (this.honeypotKicks.has(key)) return;
+    this.honeypotKicks.add(key);
+    setTimeout(() => this.honeypotKicks.delete(key), 60_000).unref?.();
+    const guild = { id: message.guild.id, name: message.guild.name };
+    const target = { id: member.id, name: member.user.tag };
+    if (!member.kickable)
+      return void this.audit?.record({ title: "Honeypot Kick Failed", category: "Verification", color: "danger", guild, target, reason: "Cookie cannot kick this member. Check Kick Members and role hierarchy." });
+    // DM before the kick: once the member shares no server with Cookie, Discord refuses the DM.
+    const dmSent = await member
+      .send(
+        `You were kicked from **${message.guild.name}** because you sent a message in the verification channel. That channel is a trap for spam bots.\n\nIf this was a mistake, you can rejoin here: ${HONEYPOT_REJOIN_URL}`,
+      )
+      .then(() => true, () => false);
+    try {
+      await member.kick("Cookie honeypot: sent a message in the verification channel");
+      this.audit?.record({ title: "Honeypot Kick", category: "Verification", color: "warning", guild, target, details: { "DM Sent": dmSent } });
+    } catch (error) {
+      this.audit?.record({ title: "Honeypot Kick Failed", category: "Verification", color: "danger", guild, target, reason: error instanceof Error ? error.message : "unknown" });
+    }
+  }
 
   async button(interaction: ButtonInteraction): Promise<void> {
     if (!interaction.guild) return;

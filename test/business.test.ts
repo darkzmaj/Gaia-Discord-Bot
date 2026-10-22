@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { createHash } from "node:crypto";
-import { PermissionFlagsBits, SystemChannelFlagsBitField } from "discord.js";
+import { GatewayIntentBits, PermissionFlagsBits, SystemChannelFlagsBitField } from "discord.js";
 import { createDatabase, type SqliteDatabase } from "../src/db/database.js";
 import { CookieRepository, type GuildBackup } from "../src/db/repositories.js";
 import {
@@ -26,6 +26,7 @@ import {
 import { commands } from "../src/commands.js";
 import { ADMIN_LABEL, STAFF_LABEL } from "../src/services/authorization.js";
 import {
+  HONEYPOT_REJOIN_URL,
   normalizeVerificationColor,
   VerificationService,
 } from "../src/services/verification-service.js";
@@ -2956,5 +2957,102 @@ describe("admin role management", () => {
     await ui.handle(step.interaction as any);
     expect(step.out.replies[0].content).toContain("Administrator");
     expect(calls).toEqual([]);
+  });
+});
+
+describe("verification channel honeypot", () => {
+  const setup = async () => {
+    const r = await repo();
+    await r.updateVerification("g", { channel_id: "verify" });
+    const audits: any[] = [];
+    const service = new VerificationService(r, { record: (e: any) => audits.push(e) } as any);
+    const events: string[] = [];
+    const memberOf = (id: string, opts: { admin?: boolean; kickable?: boolean; dmFails?: boolean } = {}) => ({
+      id,
+      user: { tag: `${id}#0` },
+      kickable: opts.kickable ?? true,
+      permissions: { has: () => !!opts.admin },
+      send: async (text: string) => {
+        if (opts.dmFails) throw new Error("Cannot send messages to this user");
+        events.push(`dm:${id}:${text}`);
+      },
+      kick: async () => void events.push(`kick:${id}`),
+    });
+    const message = (member: any, overrides: Record<string, unknown> = {}) => ({
+      inGuild: () => true,
+      author: { id: member.id, bot: false },
+      webhookId: null,
+      system: false,
+      channelId: "verify",
+      guild: { id: "g", name: "DarkDragon", members: { fetch: async () => member } },
+      member,
+      delete: async () => void events.push(`delete:${member.id}`),
+      ...overrides,
+    });
+    return { service, events, audits, memberOf, message };
+  };
+
+  it("deletes the message, DMs the rejoin link, then kicks", async () => {
+    const { service, events, audits, memberOf, message } = await setup();
+    await service.honeypot(message(memberOf("spammer")) as any);
+    expect(events.map((e) => e.split(":").slice(0, 2).join(":"))).toEqual([
+      "delete:spammer",
+      "dm:spammer",
+      "kick:spammer",
+    ]);
+    expect(events[1]).toContain("**DarkDragon**");
+    expect(events[1]).toContain(HONEYPOT_REJOIN_URL);
+    expect(HONEYPOT_REJOIN_URL).toBe("https://darkdragon.dev/discord");
+    expect(audits[0]).toMatchObject({ title: "Honeypot Kick", details: { "DM Sent": true } });
+  });
+
+  it("still kicks when the member has DMs closed", async () => {
+    const { service, events, audits, memberOf, message } = await setup();
+    await service.honeypot(message(memberOf("spammer", { dmFails: true })) as any);
+    expect(events).toEqual(["delete:spammer", "kick:spammer"]);
+    expect(audits[0].details["DM Sent"]).toBe(false);
+  });
+
+  it("kicks and DMs once for a burst of messages but deletes every one", async () => {
+    const { service, events, memberOf, message } = await setup();
+    const member = memberOf("spammer");
+    await Promise.all([1, 2, 3].map(() => service.honeypot(message(member) as any)));
+    expect(events.filter((e) => e.startsWith("delete:"))).toHaveLength(3);
+    expect(events.filter((e) => e.startsWith("dm:"))).toHaveLength(1);
+    expect(events.filter((e) => e.startsWith("kick:"))).toHaveLength(1);
+  });
+
+  it("ignores other channels, bots, webhooks, system messages and administrators", async () => {
+    const { service, events, memberOf, message } = await setup();
+    const m = memberOf("someone");
+    await service.honeypot(message(m, { channelId: "general" }) as any);
+    await service.honeypot(message(m, { author: { id: "someone", bot: true } }) as any);
+    await service.honeypot(message(m, { webhookId: "hook" }) as any);
+    await service.honeypot(message(m, { system: true }) as any);
+    await service.honeypot(message(m, { inGuild: () => false }) as any);
+    await service.honeypot(message(memberOf("boss", { admin: true })) as any);
+    expect(events).toEqual([]);
+  });
+
+  it("does nothing until a verification message has been deployed", async () => {
+    const { service, events, memberOf, message } = await setup();
+    await (service as any).repo.updateVerification("g", { channel_id: null });
+    await service.honeypot(message(memberOf("spammer")) as any);
+    expect(events).toEqual([]);
+  });
+
+  it("deletes but reports a failure when Cookie cannot kick the member", async () => {
+    const { service, events, audits, memberOf, message } = await setup();
+    await service.honeypot(message(memberOf("mod", { kickable: false })) as any);
+    expect(events).toEqual(["delete:mod"]);
+    expect(audits[0].title).toBe("Honeypot Kick Failed");
+  });
+
+  it("subscribes to guild message events", async () => {
+    const bot = new CookieBot(await repo());
+    expect(bot.client.options.intents.has(GatewayIntentBits.GuildMessages)).toBe(true);
+    expect(bot.client.options.intents.has(GatewayIntentBits.MessageContent)).toBe(false);
+    expect(bot.client.listenerCount("messageCreate")).toBe(1);
+    bot.client.destroy();
   });
 });

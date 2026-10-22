@@ -73,6 +73,8 @@ export class CookieBot {
       GatewayIntentBits.Guilds,
       GatewayIntentBits.GuildMembers,
       GatewayIntentBits.GuildVoiceStates,
+      // Message events only (no MessageContent): the verification honeypot needs to know a message exists, not its text.
+      GatewayIntentBits.GuildMessages,
     ],
   });
   readonly mutes: MuteService;
@@ -198,6 +200,17 @@ export class CookieBot {
             guildId: member.guild.id,
             userId: member.id,
             error: error instanceof Error ? error.message : "unknown",
+          }),
+        ),
+    );
+    this.client.on(
+      "messageCreate",
+      (message) =>
+        void this.verification.honeypot(message).catch((error) =>
+          logDiscordError("verification.honeypot", error, {
+            guildId: message.guildId ?? undefined,
+            channelId: message.channelId,
+            userId: message.author.id,
           }),
         ),
     );
