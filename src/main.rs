@@ -1,3 +1,6 @@
+// serenity::Error is large by design; every Discord call returns it.
+#![allow(clippy::result_large_err)]
+
 mod bot;
 mod config;
 mod db;

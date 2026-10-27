@@ -81,6 +81,8 @@
     // Covered by other lints
     clippy::missing_panics_doc, // clippy::unwrap_used
 )]
+// Gaia patch: silence upstream lint noise from newer toolchains (unused prelude imports, deprecations).
+#![allow(unused_imports, deprecated)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 #![type_length_limit = "3294819"] // needed so ShardRunner::run compiles with instrument.
 
