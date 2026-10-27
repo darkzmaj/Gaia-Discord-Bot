@@ -1,0 +1,34 @@
+[package]
+name = "gaia"
+version = "1.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+dotenvy = "0.15"
+hex = "0.4"
+unicode-normalization = "0.1"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serenity = { version = "0.12.5", default-features = false, features = ["builder", "cache", "client", "gateway", "http", "model", "utils", "rustls_backend", "chrono"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
+percent-encoding = "2"
+
+[profile.release]
+strip = true
+
+# serenity 0.12.5 plus two raw fields so modal FileUpload submissions (Label + resolved attachments) survive parsing.
+[patch.crates-io]
+serenity = { path = "vendor/serenity" }

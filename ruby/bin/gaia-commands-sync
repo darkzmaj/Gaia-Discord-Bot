@@ -1,0 +1,25 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require_relative '../lib/gaia'
+
+begin
+  Gaia::Config.load_dotenv
+  if ARGV.include?('--dry-run')
+    Gaia::Commands.assert_schema!
+    puts "Command synchronization dry run: schema=#{Gaia::Commands.fingerprint[0, 12]} commands=#{Gaia::Commands.names.join(',')}"
+    exit 0
+  end
+  Gaia::Config.require!
+  db = Gaia::Database.open(Gaia::Config.database_path)
+  rest = Gaia::DiscordRest.new(Gaia::Config.token)
+  result = Gaia::CommandSync.new(rest, db, Gaia::Config.application_id).synchronize(force_cleanup: true)
+  puts "Command synchronization complete: application=#{result[:application_id]} schema=#{result[:fingerprint][0, 12]} " \
+       "cleaned=#{result[:cleaned]} failed=#{result[:failed]}"
+  exit(result[:failed].zero? ? 0 : 1)
+rescue StandardError => e
+  warn "Command synchronization failed: #{e.message}"
+  exit 1
+ensure
+  db&.close
+end

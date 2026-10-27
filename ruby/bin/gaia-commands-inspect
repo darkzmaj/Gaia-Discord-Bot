@@ -1,0 +1,20 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require_relative '../lib/gaia'
+
+begin
+  Gaia::Config.load_dotenv
+  Gaia::Config.require!
+  db = Gaia::Database.open(Gaia::Config.database_path)
+  rest = Gaia::DiscordRest.new(Gaia::Config.token)
+  report = Gaia::CommandSync.new(rest, db, Gaia::Config.application_id)
+                            .inspect_live(Gaia::Config.diagnostic_guild_id, Gaia::Config.diagnostic_user_id)
+  puts 'GAIA COMMAND DIAGNOSTIC'
+  puts JSON.pretty_generate(report)
+rescue StandardError => e
+  warn "Command inspection failed: #{e.message}"
+  exit 1
+ensure
+  db&.close
+end

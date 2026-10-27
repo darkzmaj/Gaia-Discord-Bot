@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  ruby:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+          bundler-cache: true
+      - run: bundle exec rake test:ruby
+      - run: bundle exec rake commands:sync:dry
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t gaia-discord-bot:ci .
+      - name: Image starts and fails cleanly without a token
+        run: |
+          out=$(docker run --rm gaia-discord-bot:ci 2>&1 || true)
+          echo "$out"
+          echo "$out" | grep -q 'DISCORD_TOKEN is required'
+      - name: Ruby tooling runs inside the image
+        run: docker run --rm gaia-discord-bot:ci bundle exec rake commands:sync:dry
