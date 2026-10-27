@@ -1,56 +1,38 @@
 # syntax=docker/dockerfile:1
 
 ######################################################################################
-# Base
+# Build the Rust bot
 ######################################################################################
-FROM node:20-alpine AS base
+FROM rust:1-bookworm AS build
 WORKDIR /app
-
-######################################################################################
-# Dependencies (includes devDependencies, needed to compile TS and native modules)
-# NOTE: NODE_ENV must NOT be "production" here — npm treats that as a signal to skip
-# devDependencies (typescript, tsx, ...), which breaks `npm run build`.
-######################################################################################
-FROM base AS deps
-# python3/make/g++ are required to build the sqlite3 native addon on alpine (musl)
-RUN apk add --no-cache python3 make g++
-COPY package.json package-lock.json ./
-RUN npm ci
-
-######################################################################################
-# Build (compile TypeScript)
-######################################################################################
-FROM deps AS build
-COPY tsconfig.json ./
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN npm run build
+COPY db ./db
+COPY shared ./shared
+COPY vendor ./vendor
+RUN cargo build --release --locked
 
 ######################################################################################
-# Production dependencies only
+# Runtime: the Rust binary plus the Ruby operations tooling (migrate, commands:*)
 ######################################################################################
-FROM base AS prod-deps
-RUN apk add --no-cache python3 make g++
-COPY package.json package-lock.json ./
-RUN npm ci --omit=dev && npm cache clean --force
-
-######################################################################################
-# Runtime
-######################################################################################
-FROM node:20-alpine AS runtime
+FROM ruby:3.4-slim-bookworm AS runtime
 WORKDIR /app
-ENV NODE_ENV=production
+ENV BUNDLE_WITHOUT=test BUNDLE_DEPLOYMENT=1
 
-RUN addgroup -S cookie && adduser -S cookie -G cookie
+RUN groupadd --system gaia && useradd --system --gid gaia --home /app gaia
 
-COPY --from=prod-deps /app/node_modules ./node_modules
-COPY --from=build /app/dist ./dist
-COPY package.json ./
+COPY Gemfile Gemfile.lock Rakefile ./
+RUN bundle install && rm -rf /usr/local/bundle/cache
+COPY ruby ./ruby
+COPY db ./db
+COPY shared ./shared
+COPY --from=build /app/target/release/gaia /usr/local/bin/gaia
 
-RUN mkdir -p /app/data && chown -R cookie:cookie /app
+RUN mkdir -p /app/data && chown -R gaia:gaia /app
 
-USER cookie
+USER gaia
 
 VOLUME ["/app/data"]
 
 # Discord bots are outbound-gateway only; no port is exposed.
-CMD ["node", "dist/index.js"]
+CMD ["gaia"]

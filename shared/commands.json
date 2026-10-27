@@ -1,0 +1,56 @@
+[
+  {
+    "type": 1,
+    "name": "admin",
+    "description": "𝗔𝗱𝗺𝗶𝗻 Open Gaia Administration.",
+    "default_member_permissions": "8",
+    "integration_types": [0],
+    "contexts": [0],
+    "options": []
+  },
+  {
+    "type": 1,
+    "name": "embed",
+    "description": "𝗔𝗱𝗺𝗶𝗻 Open Gaia Embed Manager.",
+    "default_member_permissions": "8",
+    "integration_types": [0],
+    "contexts": [0],
+    "options": []
+  },
+  {
+    "type": 1,
+    "name": "mute",
+    "description": "𝗦𝘁𝗮𝗳𝗳 Temporarily mute a member.",
+    "default_member_permissions": "1099511627776",
+    "integration_types": [0],
+    "contexts": [0],
+    "options": [
+      { "type": 6, "name": "user", "description": "Member.", "required": true },
+      { "type": 3, "name": "duration", "description": "Example: 1d 4h 30m.", "required": true },
+      { "type": 3, "name": "reason", "description": "Optional reason.", "required": false }
+    ]
+  },
+  {
+    "type": 1,
+    "name": "unmute",
+    "description": "𝗦𝘁𝗮𝗳𝗳 Unmute a member.",
+    "default_member_permissions": "1099511627776",
+    "integration_types": [0],
+    "contexts": [0],
+    "options": [
+      { "type": 6, "name": "user", "description": "Member.", "required": true },
+      { "type": 3, "name": "reason", "description": "Optional reason.", "required": false }
+    ]
+  },
+  {
+    "type": 1,
+    "name": "unverify",
+    "description": "𝗔𝗱𝗺𝗶𝗻 Unverify a member.",
+    "default_member_permissions": "8",
+    "integration_types": [0],
+    "contexts": [0],
+    "options": [
+      { "type": 6, "name": "user", "description": "Member.", "required": true }
+    ]
+  }
+]

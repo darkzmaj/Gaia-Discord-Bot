@@ -1,14 +1,14 @@
 services:
-  cookie:
+  gaia:
     build:
       context: .
       dockerfile: Dockerfile
-    image: cookie-discord-bot:latest
-    container_name: cookie-discord-bot
+    image: gaia-discord-bot:latest
+    container_name: gaia-discord-bot
     restart: unless-stopped
     environment:
       DISCORD_TOKEN: ${DISCORD_TOKEN}
-      DATABASE_PATH: /app/data/cookie.sqlite
+      DATABASE_PATH: /app/data/gaia.sqlite
       APPLICATION_ID: ${APPLICATION_ID}
       DIAGNOSTIC_GUILD_ID: ${DIAGNOSTIC_GUILD_ID}
       DIAGNOSTIC_USER_ID: ${DIAGNOSTIC_USER_ID}
@@ -19,7 +19,7 @@ services:
       LOG_WEBHOOK_URL: ${LOG_WEBHOOK_URL}
       MEMBER_LOG_WEBHOOK_URL: ${MEMBER_LOG_WEBHOOK_URL}
     volumes:
-      - cookie-data:/app/data
+      - gaia-data:/app/data
     # No inbound ports: this is an outbound-only Discord gateway connection.
     # No meaningful process-external healthcheck exists for a gateway-only bot;
     # `restart: unless-stopped` recovers from crashes via the container exiting.
@@ -40,4 +40,4 @@ services:
           memory: 128M
 
 volumes:
-  cookie-data:
+  gaia-data:

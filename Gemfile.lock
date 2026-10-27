@@ -1,0 +1,24 @@
+GEM
+  remote: https://rubygems.org/
+  specs:
+    minitest (5.27.0)
+    rake (13.4.2)
+    sqlite3 (2.10.2-aarch64-linux-gnu)
+    sqlite3 (2.10.2-x64-mingw-ucrt)
+    sqlite3 (2.10.2-x86_64-linux-gnu)
+
+PLATFORMS
+  aarch64-linux
+  x64-mingw-ucrt
+  x86_64-linux
+
+DEPENDENCIES
+  minitest (~> 5.25)
+  rake (~> 13.2)
+  sqlite3 (~> 2.1)
+
+RUBY VERSION
+   ruby 3.4.11p137
+
+BUNDLED WITH
+   2.6.9
