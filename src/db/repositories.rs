@@ -541,46 +541,58 @@ impl GaiaRepository {
     pub fn remove_mute(&self, guild_id: &str, user_id: &str) -> Result<bool> {
         Ok(self.conn().execute("DELETE FROM active_mutes WHERE guild_id=? AND user_id=?", params![guild_id, user_id])? == 1)
     }
-    /// `replace` defaults to false.
-    pub fn save_embed(&self, name: &str, json: &str, actor: &str, replace: Option<bool>) -> Result<bool> {
+    // ---- embed templates: every read/write is scoped to the owning guild ----
+
+    /// `replace` defaults to false. Names are unique per guild, case-insensitively.
+    pub fn save_embed(&self, guild_id: &str, name: &str, json: &str, actor: &str, replace: Option<bool>) -> Result<bool> {
         let c = self.conn();
-        let existing = c.prepare("SELECT name FROM global_embeds WHERE name=? COLLATE NOCASE")?.exists(params![name])?;
+        let existing = c.prepare("SELECT 1 FROM embed_templates WHERE guild_id=? AND name=? COLLATE NOCASE")?.exists(params![guild_id, name])?;
         if existing && !replace.unwrap_or(false) {
             return Ok(false);
         }
         if existing {
-            c.execute("UPDATE global_embeds SET payload_json=?,updated_at=? WHERE name=? COLLATE NOCASE", params![json, now(), name])?;
+            c.execute(
+                "UPDATE embed_templates SET payload_json=?,updated_at=? WHERE guild_id=? AND name=? COLLATE NOCASE",
+                params![json, now(), guild_id, name],
+            )?;
         } else {
             let id = uuid::Uuid::new_v4().to_string();
             c.execute(
-                "INSERT INTO global_embeds(name,payload_json,template_id,created_by_id,created_at,updated_at) VALUES (?,?,?,?,?,?)",
-                params![name, json, id, actor, now(), now()],
+                "INSERT INTO embed_templates(template_id,guild_id,name,payload_json,created_by_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
+                params![id, guild_id, name, json, actor, now(), now()],
             )?;
         }
         Ok(true)
     }
-    pub fn embed(&self, name: &str) -> Result<Option<EmbedTemplate>> {
-        get(&self.conn(), "SELECT name,payload_json,template_id FROM global_embeds WHERE name=? COLLATE NOCASE", params![name])
+    pub fn embed(&self, guild_id: &str, name: &str) -> Result<Option<EmbedTemplate>> {
+        get(
+            &self.conn(),
+            "SELECT name,payload_json,template_id FROM embed_templates WHERE guild_id=? AND name=? COLLATE NOCASE",
+            params![guild_id, name],
+        )
     }
-    pub fn embed_by_id(&self, template_id: &str) -> Result<Option<EmbedTemplate>> {
-        get(&self.conn(), "SELECT name,payload_json,template_id FROM global_embeds WHERE template_id=?", params![template_id])
+    pub fn embed_by_id(&self, guild_id: &str, template_id: &str) -> Result<Option<EmbedTemplate>> {
+        get(&self.conn(), "SELECT name,payload_json,template_id FROM embed_templates WHERE guild_id=? AND template_id=?", params![guild_id, template_id])
     }
     /// Defaults: offset 0, limit 20.
-    pub fn embeds(&self, offset: Option<i64>, limit: Option<i64>) -> Result<Vec<String>> {
-        strings(&self.conn(), "SELECT name FROM global_embeds ORDER BY name COLLATE NOCASE LIMIT ? OFFSET ?", params![limit.unwrap_or(20), offset.unwrap_or(0)])
+    pub fn embeds(&self, guild_id: &str, offset: Option<i64>, limit: Option<i64>) -> Result<Vec<String>> {
+        strings(
+            &self.conn(),
+            "SELECT name FROM embed_templates WHERE guild_id=? ORDER BY name COLLATE NOCASE LIMIT ? OFFSET ?",
+            params![guild_id, limit.unwrap_or(20), offset.unwrap_or(0)],
+        )
     }
-    pub fn attachments(&self, template_id: &str) -> Result<Vec<EmbedAttachment>> {
+    pub fn attachments(&self, guild_id: &str, template_id: &str) -> Result<Vec<EmbedAttachment>> {
         let c = self.conn();
-        let mut stmt = c.prepare("SELECT * FROM global_embed_attachments WHERE template_id=? ORDER BY filename COLLATE NOCASE")?;
-        let rows = stmt.query_map(params![template_id], attachment_row)?.collect::<rusqlite::Result<_>>()?;
+        let mut stmt = c.prepare(
+            "SELECT a.* FROM embed_attachments a JOIN embed_templates t ON t.template_id=a.template_id WHERE t.guild_id=? AND a.template_id=? ORDER BY a.filename COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map(params![guild_id, template_id], attachment_row)?.collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
     #[cfg(test)]
-    pub fn attachment(&self, template_id: &str, filename: &str) -> Result<Option<EmbedAttachment>> {
-        let c = self.conn();
-        let mut stmt = c.prepare("SELECT * FROM global_embed_attachments WHERE template_id=? AND filename=?")?;
-        let mut rows = stmt.query_map(params![template_id, filename], attachment_row)?;
-        Ok(rows.next().transpose()?)
+    pub fn attachment(&self, guild_id: &str, template_id: &str, filename: &str) -> Result<Option<EmbedAttachment>> {
+        Ok(self.attachments(guild_id, template_id)?.into_iter().find(|a| a.filename == filename))
     }
     #[cfg(test)]
     pub fn schedules_for_template(&self, template_id: &str, statuses: Option<&[&str]>) -> Result<Vec<ScheduledEmbedSend>> {
@@ -594,29 +606,57 @@ impl GaiaRepository {
         );
         all(&self.conn(), &sql, params_from_iter(std::iter::once(&template_id).chain(statuses.iter())))
     }
-    pub fn save_attachment(&self, a: &EmbedAttachment) -> Result<()> {
-        self.conn().execute(
-            "INSERT INTO global_embed_attachments(id,template_id,filename,content_type,size_bytes,sha256,data,created_by_id,created_at) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(template_id,filename) DO UPDATE SET content_type=excluded.content_type,size_bytes=excluded.size_bytes,sha256=excluded.sha256,data=excluded.data,created_by_id=excluded.created_by_id,created_at=excluded.created_at",
+    /// Upserts on (template, filename) when the template belongs to `guild_id`, enforcing the per-template
+    /// count and total-size caps (a same-named file being replaced does not count against them).
+    /// Errors are user-facing.
+    pub fn save_attachment(&self, guild_id: &str, a: &EmbedAttachment, max_count: usize, max_total_bytes: usize) -> Result<()> {
+        let mut c = self.conn();
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !tx.prepare("SELECT 1 FROM embed_templates WHERE guild_id=? AND template_id=?")?.exists(params![guild_id, a.template_id])? {
+            bail!("That embed no longer exists.");
+        }
+        let (count, total): (i64, i64) = tx.query_row(
+            "SELECT COUNT(*),COALESCE(SUM(size_bytes),0) FROM embed_attachments WHERE template_id=? AND filename<>?",
+            params![a.template_id, a.filename],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if count as usize >= max_count {
+            bail!("A template can hold at most {max_count} attachments. Remove one first.");
+        }
+        if (total + a.size_bytes) as usize > max_total_bytes {
+            bail!("Template attachment total would exceed the {} MB limit.", max_total_bytes / 1024 / 1024);
+        }
+        tx.execute(
+            "INSERT INTO embed_attachments(id,template_id,filename,content_type,size_bytes,sha256,data,created_by_id,created_at) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(template_id,filename) DO UPDATE SET content_type=excluded.content_type,size_bytes=excluded.size_bytes,sha256=excluded.sha256,data=excluded.data,created_by_id=excluded.created_by_id,created_at=excluded.created_at",
             params![a.id, a.template_id, a.filename, a.content_type, a.size_bytes, a.sha256, a.data, a.created_by_id, a.created_at],
         )?;
+        tx.commit()?;
         Ok(())
     }
-    pub fn delete_attachment(&self, template_id: &str, filename: &str) -> Result<bool> {
-        Ok(self.conn().execute("DELETE FROM global_embed_attachments WHERE template_id=? AND filename=?", params![template_id, filename])? == 1)
+    pub fn delete_attachment(&self, guild_id: &str, template_id: &str, filename: &str) -> Result<bool> {
+        Ok(self.conn().execute(
+            "DELETE FROM embed_attachments WHERE template_id=? AND filename=? AND template_id IN (SELECT template_id FROM embed_templates WHERE guild_id=?)",
+            params![template_id, filename, guild_id],
+        )? == 1)
     }
+    /// Fails unless the template belongs to the schedule's guild.
     pub fn create_schedule(&self, s: &ScheduledEmbedSend) -> Result<()> {
-        self.conn().execute(
-            "INSERT INTO scheduled_embed_sends(id,template_id,guild_id,channel_id,scheduled_for_utc,timezone,created_by_user_id,created_at,updated_by_user_id,updated_at,status,sent_at,sent_message_id,failure_code,failure_reason,attempt_count,last_attempt_at,processing_started_at,template_name_snapshot) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        let mention = s.mention_json.clone().unwrap_or_else(|| r#"{"roles":[],"everyone":false,"here":false}"#.into());
+        let inserted = self.conn().execute(
+            "INSERT INTO scheduled_embed_sends(id,template_id,guild_id,channel_id,scheduled_for_utc,timezone,created_by_user_id,created_at,updated_by_user_id,updated_at,status,sent_at,sent_message_id,failure_code,failure_reason,attempt_count,last_attempt_at,processing_started_at,template_name_snapshot,mention_json) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM embed_templates WHERE template_id=?2 AND guild_id=?3)",
             params![
                 s.id, s.template_id, s.guild_id, s.channel_id, s.scheduled_for_utc, s.timezone, s.created_by_user_id, s.created_at,
                 s.updated_by_user_id, s.updated_at, s.status, s.sent_at, s.sent_message_id, s.failure_code, s.failure_reason,
-                s.attempt_count, s.last_attempt_at, s.processing_started_at, s.template_name_snapshot
+                s.attempt_count, s.last_attempt_at, s.processing_started_at, s.template_name_snapshot, mention
             ],
         )?;
+        if inserted != 1 {
+            bail!("That embed no longer exists.");
+        }
         Ok(())
     }
-    pub fn schedule(&self, id: &str) -> Result<Option<ScheduledEmbedSend>> {
-        get(&self.conn(), "SELECT * FROM scheduled_embed_sends WHERE id=?", params![id])
+    pub fn schedule(&self, guild_id: &str, id: &str) -> Result<Option<ScheduledEmbedSend>> {
+        get(&self.conn(), "SELECT * FROM scheduled_embed_sends WHERE id=? AND guild_id=?", params![id, guild_id])
     }
     /// `limit` defaults to 25.
     pub fn upcoming_schedules(&self, guild_id: &str, limit: Option<i64>) -> Result<Vec<ScheduledEmbedSend>> {
@@ -708,15 +748,20 @@ impl GaiaRepository {
             ],
         )? as i64)
     }
+    /// Only records sends of a template owned by `guild_id`.
     pub fn track_sent_embed(&self, embed_id: &str, guild_id: &str, channel_id: &str, message_id: &str) -> Result<()> {
         self.conn().execute(
-            "INSERT OR IGNORE INTO sent_embed_messages(embed_id,guild_id,channel_id,message_id,created_at) VALUES (?,?,?,?,?)",
+            "INSERT OR IGNORE INTO sent_embed_messages(embed_id,guild_id,channel_id,message_id,created_at) SELECT ?1,?2,?3,?4,?5 WHERE EXISTS(SELECT 1 FROM embed_templates WHERE template_id=?1 AND guild_id=?2)",
             params![embed_id, guild_id, channel_id, message_id, now()],
         )?;
         Ok(())
     }
     pub fn sent_embeds(&self, embed_id: &str, guild_id: &str) -> Result<Vec<SentEmbed>> {
-        all(&self.conn(), "SELECT id,channel_id,message_id FROM sent_embed_messages WHERE embed_id=? AND guild_id=?", params![embed_id, guild_id])
+        all(
+            &self.conn(),
+            "SELECT s.id,s.channel_id,s.message_id FROM sent_embed_messages s JOIN embed_templates t ON t.template_id=s.embed_id WHERE s.embed_id=? AND s.guild_id=? AND t.guild_id=s.guild_id",
+            params![embed_id, guild_id],
+        )
     }
     pub fn remove_sent_embed(&self, id: i64) -> Result<()> {
         self.conn().execute("DELETE FROM sent_embed_messages WHERE id=?", params![id])?;
@@ -756,6 +801,10 @@ impl GaiaRepository {
         ensure_guild(&c, guild_id)?;
         get(&c, "SELECT * FROM verification_config WHERE guild_id=?", params![guild_id])?.ok_or_else(|| anyhow!("verification config missing"))
     }
+    /// Read-only lookup for hot paths (no ensure_guild, no writes); `None` when the guild has no row yet.
+    pub fn verification_lookup(&self, guild_id: &str) -> Result<Option<VerificationConfig>> {
+        get(&self.conn(), "SELECT * FROM verification_config WHERE guild_id=?", params![guild_id])
+    }
     pub fn update_verification(&self, guild_id: &str, f: &VerificationUpdate) -> Result<()> {
         let c = self.conn();
         ensure_guild(&c, guild_id)?;
@@ -794,6 +843,13 @@ impl GaiaRepository {
         ] {
             tx.execute(&format!("DELETE FROM {table} WHERE guild_id=?"), params![guild_id])?;
         }
+        // Embed templates belong to the guild: drop them with their schedules (history included), attachments
+        // and any tracking rows. Explicit deletes, so this does not depend on foreign_keys being ON.
+        const OWNED: &str = "SELECT template_id FROM embed_templates WHERE guild_id=?1";
+        tx.execute(&format!("DELETE FROM sent_embed_messages WHERE embed_id IN ({OWNED})"), params![guild_id])?;
+        tx.execute(&format!("DELETE FROM scheduled_embed_sends WHERE guild_id=?1 OR template_id IN ({OWNED})"), params![guild_id])?;
+        tx.execute(&format!("DELETE FROM embed_attachments WHERE template_id IN ({OWNED})"), params![guild_id])?;
+        tx.execute("DELETE FROM embed_templates WHERE guild_id=?", params![guild_id])?;
         tx.commit()?;
         Ok(())
     }
@@ -806,8 +862,9 @@ impl GaiaRepository {
     pub fn backups(&self, source_guild_id: &str) -> Result<Vec<GuildBackup>> {
         all(&self.conn(), "SELECT * FROM guild_backups WHERE source_guild_id=? ORDER BY created_at DESC", params![source_guild_id])
     }
-    pub fn all_backups(&self) -> Result<Vec<GuildBackup>> {
-        all(&self.conn(), "SELECT * FROM guild_backups ORDER BY created_at DESC LIMIT 100", [])
+    /// Manual backups a user created, for the creator fallback once Gaia has left the source guild.
+    pub fn manual_backups_created_by(&self, user_id: &str) -> Result<Vec<GuildBackup>> {
+        all(&self.conn(), "SELECT * FROM guild_backups WHERE created_by=? AND creation_type='manual' ORDER BY created_at DESC", params![user_id])
     }
     pub fn backup(&self, backup_id: &str) -> Result<Option<GuildBackup>> {
         get(&self.conn(), "SELECT * FROM guild_backups WHERE backup_id=?", params![backup_id])
@@ -1085,11 +1142,22 @@ mod tests {
         let r = repo();
         r.set_autorole("a", "user_role_id", Some("role-a")).unwrap();
         r.set_autorole("b", "user_role_id", Some("role-b")).unwrap();
-        r.save_embed("Global", r#"{"content":"shared"}"#, "admin", None).unwrap();
+        r.save_embed("a", "Mine", r#"{"content":"a"}"#, "admin", None).unwrap();
+        r.save_embed("b", "Mine", r#"{"content":"b"}"#, "admin", None).unwrap();
+        let t = r.embed("a", "Mine").unwrap().unwrap().template_id;
+        r.save_attachment("a", &attachment(&t, "x.png"), 10, 1 << 20).unwrap();
+        r.create_schedule(&schedule("s", &t, "a")).unwrap();
+        r.track_sent_embed(&t, "a", "c", "m").unwrap();
         r.purge_guild("a").unwrap();
         assert_eq!(r.autoroles("b").unwrap(), Autoroles { user_role_id: Some("role-b".into()), bot_role_id: None });
-        assert!(r.embed("Global").unwrap().is_some());
+        assert!(r.embed("a", "Mine").unwrap().is_none(), "templates belong to the removed guild");
+        assert!(r.schedules_for_template(&t, Some(&["scheduled", "sent"])).unwrap().is_empty());
+        assert_eq!(r.embed("b", "Mine").unwrap().unwrap().payload_json, r#"{"content":"b"}"#);
         assert_eq!(r.autoroles("a").unwrap(), Autoroles::default());
+        let c = r.conn();
+        for table in ["embed_attachments", "sent_embed_messages"] {
+            assert_eq!(c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |x| x.get::<_, i64>(0)).unwrap(), 0, "{table}");
+        }
     }
 
     // ---- guild backup persistence ----
@@ -1195,77 +1263,142 @@ mod tests {
         assert_eq!(r.backup_assets("source").unwrap()[0].data, vec![1, 2, 3]);
     }
 
-    // ---- global embeds ----
-    #[test]
-    fn case_insensitive_unique_embed_names() {
-        let r = repo();
-        assert!(r.save_embed("Welcome", r#"{"content":"hi"}"#, "admin", None).unwrap());
-        assert!(!r.save_embed("welcome", r#"{"content":"bye"}"#, "admin", None).unwrap());
-        assert_eq!(r.embed("WELCOME").unwrap().unwrap().name, "Welcome");
-        assert!(r.save_embed("welcome", r#"{"content":"bye"}"#, "admin", Some(true)).unwrap());
-        assert_eq!(r.embed("Welcome").unwrap().unwrap().payload_json, r#"{"content":"bye"}"#);
-        assert_eq!(r.embeds(None, None).unwrap(), ["Welcome"]);
-    }
-    #[test]
-    fn tracks_sent_instances_per_guild() {
-        let r = repo();
-        r.save_embed("Rules", r#"{"content":"rules"}"#, "admin", None).unwrap();
-        let t = r.embed("Rules").unwrap().unwrap().template_id;
-        r.track_sent_embed(&t, "a", "channel-a", "message-a").unwrap();
-        r.track_sent_embed(&t, "b", "channel-b", "message-b").unwrap();
-        let a = r.sent_embeds(&t, "a").unwrap();
-        assert_eq!(a.len(), 1);
-        assert_eq!((a[0].channel_id.as_str(), a[0].message_id.as_str()), ("channel-a", "message-a"));
-        let b = r.sent_embeds(&t, "b").unwrap();
-        assert_eq!((b.len(), b[0].message_id.as_str()), (1, "message-b"));
-    }
-    #[test]
-    fn stores_attachment_bytes() {
-        let r = repo();
-        r.save_embed("Image", "{}", "admin", None).unwrap();
-        let t = r.embed("Image").unwrap().unwrap().template_id;
-        let mut a = EmbedAttachment {
-            id: "att".into(),
-            template_id: t.clone(),
-            filename: "card.png".into(),
+    // ---- per-guild embeds ----
+    fn attachment(template_id: &str, filename: &str) -> EmbedAttachment {
+        EmbedAttachment {
+            id: uuid::Uuid::new_v4().to_string(),
+            template_id: template_id.into(),
+            filename: filename.into(),
             content_type: "image/png".into(),
             size_bytes: 5,
             sha256: "h".into(),
             data: b"image".to_vec(),
             created_by_id: "admin".into(),
             created_at: now(),
-        };
-        r.save_attachment(&a).unwrap();
-        a.id = "att2".into();
-        a.data = b"other".to_vec();
-        r.save_attachment(&a).unwrap(); // upsert on (template_id, filename)
-        assert_eq!(r.attachments(&t).unwrap().len(), 1);
-        assert_eq!(r.attachment(&t, "card.png").unwrap().unwrap().data, b"other");
-        assert!(r.delete_attachment(&t, "card.png").unwrap());
-        assert!(r.attachment(&t, "card.png").unwrap().is_none());
+        }
     }
-    #[test]
-    fn claims_due_schedule_once_and_keeps_history() {
-        let r = repo();
-        r.save_embed("Soon", r#"{"content":"hi"}"#, "admin", None).unwrap();
-        let t = r.embed("Soon").unwrap().unwrap().template_id;
+    fn schedule(id: &str, template_id: &str, guild_id: &str) -> ScheduledEmbedSend {
         let stamp = now();
-        r.create_schedule(&ScheduledEmbedSend {
-            id: "schedule".into(),
-            template_id: t.clone(),
-            guild_id: "a".into(),
+        ScheduledEmbedSend {
+            id: id.into(),
+            template_id: template_id.into(),
+            guild_id: guild_id.into(),
             channel_id: "c".into(),
             scheduled_for_utc: stamp.clone(),
             timezone: "Europe/Ljubljana".into(),
             created_by_user_id: "admin".into(),
             created_at: stamp.clone(),
             updated_by_user_id: "admin".into(),
-            updated_at: stamp.clone(),
+            updated_at: stamp,
             status: "scheduled".into(),
             template_name_snapshot: "Soon".into(),
             ..Default::default()
-        })
-        .unwrap();
+        }
+    }
+    #[test]
+    fn case_insensitive_unique_embed_names_per_guild() {
+        let r = repo();
+        assert!(r.save_embed("a", "Welcome", r#"{"content":"hi"}"#, "admin", None).unwrap());
+        assert!(!r.save_embed("a", "welcome", r#"{"content":"bye"}"#, "admin", None).unwrap());
+        assert_eq!(r.embed("a", "WELCOME").unwrap().unwrap().name, "Welcome");
+        assert!(r.save_embed("a", "welcome", r#"{"content":"bye"}"#, "admin", Some(true)).unwrap());
+        assert_eq!(r.embed("a", "Welcome").unwrap().unwrap().payload_json, r#"{"content":"bye"}"#);
+        assert_eq!(r.embeds("a", None, None).unwrap(), ["Welcome"]);
+        // Another guild may use the same name independently.
+        assert!(r.save_embed("b", "WELCOME", r#"{"content":"b"}"#, "admin", None).unwrap());
+        assert_eq!(r.embed("a", "Welcome").unwrap().unwrap().payload_json, r#"{"content":"bye"}"#);
+        assert_eq!(r.embeds("b", None, None).unwrap(), ["WELCOME"]);
+    }
+    #[test]
+    fn guilds_cannot_see_or_touch_each_others_templates() {
+        let r = repo();
+        r.save_embed("b", "Secret", r#"{"content":"b only"}"#, "admin", None).unwrap();
+        let t = r.embed("b", "Secret").unwrap().unwrap().template_id;
+        r.save_attachment("b", &attachment(&t, "x.png"), 10, 1 << 20).unwrap();
+        assert!(r.embed("a", "Secret").unwrap().is_none());
+        assert!(r.embed_by_id("a", &t).unwrap().is_none());
+        assert!(r.embeds("a", None, None).unwrap().is_empty());
+        assert!(r.attachments("a", &t).unwrap().is_empty());
+        assert!(r.save_attachment("a", &attachment(&t, "y.png"), 10, 1 << 20).is_err());
+        assert!(!r.delete_attachment("a", &t, "x.png").unwrap());
+        assert!(r.create_schedule(&schedule("s", &t, "a")).is_err());
+        r.track_sent_embed(&t, "a", "c", "m").unwrap();
+        assert!(r.sent_embeds(&t, "a").unwrap().is_empty());
+        // Saving under guild A's name never overwrites guild B's template.
+        assert!(r.save_embed("a", "Secret", "{}", "admin", Some(true)).unwrap());
+        assert_eq!(r.embed("b", "Secret").unwrap().unwrap().payload_json, r#"{"content":"b only"}"#);
+        assert_eq!(r.attachments("b", &t).unwrap().len(), 1);
+        r.create_schedule(&schedule("s", &t, "b")).unwrap();
+        assert!(r.schedule("a", "s").unwrap().is_none());
+        assert!(r.schedule("b", "s").unwrap().is_some());
+    }
+    #[test]
+    fn legacy_unowned_templates_are_hidden() {
+        let r = repo();
+        r.conn()
+            .execute_batch(
+                "INSERT INTO embed_templates(template_id,guild_id,name,payload_json,created_by_id,created_at,updated_at) VALUES ('old',NULL,'Old','{}','u','t','t')",
+            )
+            .unwrap();
+        assert!(r.embeds("a", None, None).unwrap().is_empty());
+        assert!(r.embed_by_id("a", "old").unwrap().is_none());
+        assert!(r.save_embed("a", "Old", "{}", "admin", None).unwrap(), "legacy names do not block a guild");
+    }
+    #[test]
+    fn tracks_sent_instances_per_guild() {
+        // TS "tracks sent instances by template and guild without cross-guild leakage".
+        let r = repo();
+        r.save_embed("a", "Rules", r#"{"content":"rules"}"#, "admin", None).unwrap();
+        r.save_embed("b", "Rules", r#"{"content":"rules"}"#, "admin", None).unwrap();
+        let ta = r.embed("a", "Rules").unwrap().unwrap().template_id;
+        let tb = r.embed("b", "Rules").unwrap().unwrap().template_id;
+        r.track_sent_embed(&ta, "a", "channel-a", "message-a").unwrap();
+        r.track_sent_embed(&tb, "b", "channel-b", "message-b").unwrap();
+        let a = r.sent_embeds(&ta, "a").unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!((a[0].channel_id.as_str(), a[0].message_id.as_str()), ("channel-a", "message-a"));
+        let b = r.sent_embeds(&tb, "b").unwrap();
+        assert_eq!((b.len(), b[0].message_id.as_str()), (1, "message-b"));
+        assert!(r.sent_embeds(&ta, "b").unwrap().is_empty());
+    }
+    #[test]
+    fn stores_attachment_bytes() {
+        let r = repo();
+        r.save_embed("a", "Image", "{}", "admin", None).unwrap();
+        let t = r.embed("a", "Image").unwrap().unwrap().template_id;
+        let mut a = attachment(&t, "card.png");
+        r.save_attachment("a", &a, 10, 1 << 20).unwrap();
+        a.id = "att2".into();
+        a.data = b"other".to_vec();
+        r.save_attachment("a", &a, 1, 1 << 20).unwrap(); // upsert on (template_id, filename); a replacement fits the cap
+        assert_eq!(r.attachments("a", &t).unwrap().len(), 1);
+        assert_eq!(r.attachment("a", &t, "card.png").unwrap().unwrap().data, b"other");
+        assert!(r.delete_attachment("a", &t, "card.png").unwrap());
+        assert!(r.attachment("a", &t, "card.png").unwrap().is_none());
+    }
+    #[test]
+    fn enforces_attachment_count_and_total_caps_on_save() {
+        let r = repo();
+        r.save_embed("a", "Image", "{}", "admin", None).unwrap();
+        let t = r.embed("a", "Image").unwrap().unwrap().template_id;
+        r.save_attachment("a", &attachment(&t, "1.png"), 2, 10).unwrap();
+        r.save_attachment("a", &attachment(&t, "2.png"), 2, 10).unwrap();
+        let error = r.save_attachment("a", &attachment(&t, "3.png"), 2, 100).unwrap_err();
+        assert!(error.to_string().contains("at most 2 attachments"));
+        r.delete_attachment("a", &t, "2.png").unwrap();
+        let error = r.save_attachment("a", &attachment(&t, "3.png"), 5, 9).unwrap_err();
+        assert!(error.to_string().contains("exceed"));
+        assert_eq!(r.attachments("a", &t).unwrap().len(), 1);
+    }
+    #[test]
+    fn claims_due_schedule_once_and_keeps_history() {
+        // TS "claims a due schedule once and keeps history without deleting it".
+        let r = repo();
+        r.save_embed("a", "Soon", r#"{"content":"hi"}"#, "admin", None).unwrap();
+        let t = r.embed("a", "Soon").unwrap().unwrap().template_id;
+        let s = schedule("schedule", &t, "a");
+        let stamp = s.scheduled_for_utc.clone();
+        r.create_schedule(&s).unwrap();
         assert_eq!(r.schedules_for_template(&t, None).unwrap().len(), 1);
         let claimed = r.claim_due_schedule(&stamp).unwrap().unwrap();
         assert_eq!((claimed.status.as_str(), claimed.attempt_count), ("processing", 1));
@@ -1282,5 +1415,22 @@ mod tests {
         assert_eq!((h[0].id.as_str(), h[0].status.as_str(), h[0].sent_message_id.as_deref()), ("schedule", "sent", Some("message")));
         assert!(h[0].mention_json.is_some());
         assert!(!r.update_schedule("schedule", "x", &ScheduleUpdate::default()).unwrap());
+    }
+    #[test]
+    fn create_schedule_persists_the_chosen_mention() {
+        let r = repo();
+        r.save_embed("a", "Ping", "{}", "admin", None).unwrap();
+        let t = r.embed("a", "Ping").unwrap().unwrap().template_id;
+        let mention = r#"{"roles":["111"],"everyone":true,"here":false}"#;
+        r.create_schedule(&ScheduledEmbedSend { mention_json: Some(mention.into()), ..schedule("s", &t, "a") }).unwrap();
+        assert_eq!(r.schedule("a", "s").unwrap().unwrap().mention_json.as_deref(), Some(mention));
+    }
+    #[test]
+    fn verification_lookup_is_read_only() {
+        let r = repo();
+        assert!(r.verification_lookup("a").unwrap().is_none());
+        assert_eq!(r.conn().query_row("SELECT COUNT(*) FROM guild_settings", [], |x| x.get::<_, i64>(0)).unwrap(), 0);
+        r.verification("a").unwrap();
+        assert_eq!(r.verification_lookup("a").unwrap().unwrap().guild_id, "a");
     }
 }

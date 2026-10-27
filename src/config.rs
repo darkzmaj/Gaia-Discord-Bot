@@ -4,20 +4,20 @@ fn optional_env(name: &str) -> Option<String> {
     env::var(name).ok().map(|value| value.trim().to_string())
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct AuditLogging {
     pub webhook_url: Option<String>,
     pub guild_id: Option<String>,
     pub channel_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct MemberLogging {
     pub webhook_url: Option<String>,
     pub channel_id: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Config {
     pub token: String,
     pub database_path: String,
@@ -55,5 +55,41 @@ impl Config {
             anyhow::bail!("DATABASE_PATH cannot be empty. See .env.example.");
         }
         Ok(())
+    }
+}
+
+/// Secrets (bot token, webhook URLs) print only as whether they are set.
+fn secret(value: Option<&str>) -> &'static str {
+    if value.is_some_and(|v| !v.is_empty()) { "[redacted]" } else { "[unset]" }
+}
+
+impl std::fmt::Debug for AuditLogging {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditLogging")
+            .field("webhook_url", &secret(self.webhook_url.as_deref()))
+            .field("guild_id", &self.guild_id)
+            .field("channel_id", &self.channel_id)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for MemberLogging {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemberLogging")
+            .field("webhook_url", &secret(self.webhook_url.as_deref()))
+            .field("channel_id", &self.channel_id)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("token", &secret(Some(&self.token)))
+            .field("database_path", &self.database_path)
+            .field("application_id", &self.application_id)
+            .field("audit_logging", &self.audit_logging)
+            .field("member_logging", &self.member_logging)
+            .finish()
     }
 }

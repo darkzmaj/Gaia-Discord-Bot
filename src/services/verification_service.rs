@@ -18,7 +18,7 @@ pub fn normalize_verification_color(input: &str) -> Option<i64> {
 }
 
 // shortcut: one rejoin link for every guild Gaia is in; make it a per-guild setting if Gaia serves other communities.
-pub const HONEYPOT_REJOIN_URL: &str = "https://darkdragon.dev/discord";
+pub const HONEYPOT_REJOIN_URL: &str = "https://discord.gg/rrtgDYd6a8";
 
 pub fn honeypot_dm(guild_name: &str) -> String {
     format!(
@@ -63,6 +63,19 @@ fn kickable(guild: &Guild, me: &Member, member: &Member) -> bool {
         && (me.user.id == guild.owner_id || highest_role(guild, me) > highest_role(guild, member))
 }
 
+/// @everyone's effective Send Messages in `channel` (base role permissions + its channel overwrite).
+fn everyone_can_send(guild: &Guild, channel: &GuildChannel) -> bool {
+    let everyone = guild.id.everyone_role();
+    let mut perms = guild.roles.get(&everyone).map_or(Permissions::empty(), |r| r.permissions);
+    if perms.administrator() {
+        return true;
+    }
+    if let Some(o) = channel.permission_overwrites.iter().find(|o| o.kind == PermissionOverwriteType::Role(everyone)) {
+        perms = (perms - o.deny) | o.allow;
+    }
+    perms.contains(Permissions::VIEW_CHANNEL | Permissions::SEND_MESSAGES)
+}
+
 pub struct VerificationService {
     repo: Arc<GaiaRepository>,
     audit: Option<Arc<AuditLogService>>,
@@ -105,8 +118,10 @@ impl VerificationService {
         if message.author.bot || message.webhook_id.is_some() || system {
             return Ok(());
         }
-        let config = self.repo.verification(&guild.to_string())?;
-        if config.channel_id.is_none() || config.channel_id != Some(message.channel_id.to_string()) {
+        // Pure SELECT: this runs for every guild message, so no ensure_guild writes here.
+        let Some(config) = self.repo.verification_lookup(&guild.to_string())? else { return Ok(()) };
+        let deployed = config.message_id.is_some() && config.channel_id == Some(message.channel_id.to_string());
+        if config.enabled == 0 || !deployed {
             return Ok(());
         }
         let http = &self.discord.http;
@@ -117,12 +132,13 @@ impl VerificationService {
         };
         let Some(member) = member else { return Ok(()) };
         let me_id = self.discord.cache.current_user().id;
-        let (is_admin, can_kick, guild_name) = {
+        let (exempt, can_kick, guild_name) = {
             let Some(g) = self.discord.cache.guild(guild) else { return Ok(()) };
             let can_kick = g.members.get(&me_id).is_some_and(|me| kickable(&g, me, &member));
-            (g.member_permissions(&member).administrator(), can_kick, g.name.clone())
+            let perms = g.member_permissions(&member);
+            (perms.administrator() || perms.manage_messages() || perms.kick_members(), can_kick, g.name.clone())
         };
-        if is_admin {
+        if exempt || self.repo.is_staff(&guild.to_string(), &member.user.id.to_string())? {
             return Ok(());
         }
         let _ = message.delete(http).await;
@@ -329,6 +345,11 @@ impl VerificationService {
             if !g.user_permissions_in(channel, me).contains(needed) {
                 return Some("Gaia needs View Channel, Send Messages, and Embed Links in that channel.".into());
             }
+            if everyone_can_send(g, channel) {
+                return Some(
+                    "@everyone can send messages in that channel. Gaia kicks anyone who posts in the verification channel, so make it read-only for @everyone first.".into(),
+                );
+            }
         }
         None
     }
@@ -453,8 +474,207 @@ mod tests {
         let dm = honeypot_dm("DarkDragon");
         assert!(dm.contains("**DarkDragon**"));
         assert!(dm.contains(HONEYPOT_REJOIN_URL));
-        assert_eq!(HONEYPOT_REJOIN_URL, "https://darkdragon.dev/discord");
+        assert_eq!(HONEYPOT_REJOIN_URL, "https://discord.gg/rrtgDYd6a8");
         let claims: Vec<bool> = (0..3).map(|_| service.claim_honeypot_kick("g:spammer".into())).collect();
         assert_eq!(claims, [true, false, false]);
+    }
+
+    // ---- behaviour against the fake Discord ----
+
+    use crate::test_support::{GuildSeed, Harness, BOT_ID};
+    use serde_json::json;
+
+    const VERIFY: u64 = 300;
+    const VERIFIED_ROLE: u64 = 30;
+    const SPAMMER: u64 = 5;
+    const BOSS: u64 = 6;
+    const NEWCOMER: u64 = 7;
+    const MODERATOR: u64 = 8;
+    const VERIFIED: u64 = 9;
+    const HELPER: u64 = 10;
+    const BOUNCER: u64 = 11;
+    const STAFF: u64 = 12;
+
+    /// Gaia (role 20, position 10) can kick and manage roles; the moderator's role 50 sits above it.
+    async fn live() -> (Harness, VerificationService) {
+        let h = Harness::start().await;
+        h.seed(
+            GuildSeed::new(1, "DarkDragon")
+                .role(VERIFIED_ROLE, "Verified", 1, Permissions::empty())
+                .role(20, "Gaia", 10, Permissions::MANAGE_ROLES | Permissions::KICK_MEMBERS)
+                .role(40, "Admin", 2, Permissions::ADMINISTRATOR)
+                .role(50, "Moderator", 15, Permissions::empty())
+                .channel(VERIFY, ChannelType::Text, None)
+                .channel(301, ChannelType::Text, None)
+                .channel(302, ChannelType::Text, None)
+                .overwrite(302, 1, true, Permissions::empty(), Permissions::SEND_MESSAGES)
+                .overwrite(302, BOT_ID, false, Permissions::SEND_MESSAGES | Permissions::EMBED_LINKS, Permissions::empty())
+                .channel(303, ChannelType::Text, None)
+                .overwrite(303, BOT_ID, false, Permissions::EMBED_LINKS, Permissions::empty())
+                .role(60, "Helper", 3, Permissions::MANAGE_MESSAGES)
+                .role(61, "Bouncer", 3, Permissions::KICK_MEMBERS)
+                .member(HELPER, &[60])
+                .member(BOUNCER, &[61])
+                .member(STAFF, &[])
+                .bot(&[20])
+                .member(SPAMMER, &[])
+                .member(BOSS, &[40])
+                .member(NEWCOMER, &[])
+                .member(MODERATOR, &[50])
+                .member(VERIFIED, &[VERIFIED_ROLE]),
+        );
+        let update = VerificationUpdate {
+            enabled: Some(1),
+            role_id: Some(Some(VERIFIED_ROLE.to_string())),
+            channel_id: Some(Some(VERIFY.to_string())),
+            message_id: Some(Some("400".into())),
+            ..Default::default()
+        };
+        h.repo.update_verification("1", &update).unwrap();
+        let service = VerificationService::new(h.repo.clone(), h.discord.clone(), Some(h.audit.clone()));
+        (h, service)
+    }
+
+    fn field(audit: &serde_json::Value, name: &str) -> Option<String> {
+        audit["fields"].as_array()?.iter().find(|f| f["name"] == name).and_then(|f| f["value"].as_str()).map(str::to_string)
+    }
+
+    #[tokio::test]
+    async fn serializes_rapid_verification_clicks_so_the_role_is_assigned_once() {
+        let (h, service) = live().await;
+        let (a, b) = (h.button(1, NEWCOMER, "verify:click"), h.button(1, NEWCOMER, "verify:click"));
+        let (first, second) = tokio::join!(service.button(&a), service.button(&b));
+        first.unwrap();
+        second.unwrap();
+        let adds = h.calls_to("PUT", "/guilds/1/members/7/roles/30");
+        assert_eq!(adds.len(), 1);
+        assert_eq!(adds[0].reason.as_deref(), Some("Gaia verification"));
+        let replies: Vec<_> = h.replies().iter().map(|r| r["data"]["content"].clone()).collect();
+        assert_eq!(replies, ["🟢 You have been verified.", "🟢 You are already verified."]);
+        assert!(h.replies().iter().all(|r| r["data"]["flags"] == 64), "replies are ephemeral");
+    }
+
+    #[tokio::test]
+    async fn unverifies_only_a_current_guild_member_holding_the_configured_role() {
+        let (h, service) = live().await;
+        assert_eq!(service.unverify(A, "9", None).await.unwrap(), changed(true));
+        assert_eq!(service.unverify(A, "9", None).await.unwrap(), changed(false));
+        assert_eq!(service.unverify(A, "999", None).await.unwrap(), failed("That user is not a member of this server."));
+        let removals = h.calls_to("DELETE", "/guilds/1/members/*/roles/30");
+        assert_eq!(removals.len(), 1);
+        assert_eq!(removals[0].path, "/guilds/1/members/9/roles/30");
+        assert_eq!(removals[0].reason.as_deref(), Some("Gaia unverify"));
+    }
+
+    #[tokio::test]
+    async fn honeypot_deletes_the_message_dms_the_rejoin_link_then_kicks() {
+        let (h, service) = live().await;
+        let message = h.message(1, VERIFY, SPAMMER, "buy cheap nitro");
+        service.honeypot(&message).await.unwrap();
+        let dm_channel = h.calls_to("POST", "/users/@me/channels");
+        assert_eq!(dm_channel[0].body["recipient_id"], "5");
+        let trace = h.trace();
+        assert_eq!(trace.len(), 4);
+        assert_eq!(trace[0], format!("DELETE /channels/300/messages/{}", message.id));
+        assert_eq!(trace[1], "POST /users/@me/channels");
+        assert!(trace[2].starts_with("POST /channels/") && trace[2].ends_with("/messages"));
+        assert_eq!(trace[3], "DELETE /guilds/1/members/5");
+        let dm = h.dms()[0]["content"].as_str().unwrap().to_string();
+        assert!(dm.contains("**DarkDragon**") && dm.contains(HONEYPOT_REJOIN_URL));
+        assert_eq!(h.calls()[3].reason.as_deref(), Some("Gaia honeypot: sent a message in the verification channel"));
+        let audits = h.audits().await;
+        assert_eq!(audits[0]["title"], "Honeypot Kick");
+        assert_eq!(field(&audits[0], "DM Sent").as_deref(), Some("true"));
+    }
+
+    #[tokio::test]
+    async fn honeypot_still_kicks_when_the_member_has_dms_closed() {
+        let (h, service) = live().await;
+        h.on("POST", "/channels/*/messages", 403, json!({"code": 50007, "message": "Cannot send messages to this user"}));
+        service.honeypot(&h.message(1, VERIFY, SPAMMER, "spam")).await.unwrap();
+        assert_eq!(h.calls_to("DELETE", "/channels/300/messages/*").len(), 1);
+        assert_eq!(h.calls_to("DELETE", "/guilds/1/members/5").len(), 1);
+        let audits = h.audits().await;
+        assert_eq!(audits[0]["title"], "Honeypot Kick");
+        assert_eq!(field(&audits[0], "DM Sent").as_deref(), Some("false"));
+    }
+
+    #[tokio::test]
+    async fn honeypot_ignores_other_channels_bots_webhooks_system_messages_and_administrators() {
+        let (h, service) = live().await;
+        let mut messages = vec![h.message(1, 301, SPAMMER, "hi"), h.message(1, VERIFY, BOSS, "testing the trap")];
+        let mut bot = h.message(1, VERIFY, SPAMMER, "beep");
+        bot.author.bot = true;
+        let mut webhook = h.message(1, VERIFY, SPAMMER, "hook");
+        webhook.webhook_id = Some(WebhookId::new(77));
+        let mut system = h.message(1, VERIFY, SPAMMER, "");
+        system.kind = MessageType::MemberJoin;
+        let mut direct = h.message(1, VERIFY, SPAMMER, "dm");
+        direct.guild_id = None;
+        messages.extend([bot, webhook, system, direct]);
+        for message in &messages {
+            service.honeypot(message).await.unwrap();
+        }
+        assert_eq!(h.trace(), Vec::<String>::new());
+        assert!(h.audits().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn honeypot_does_nothing_until_a_verification_message_has_been_deployed() {
+        let (h, service) = live().await;
+        h.repo.update_verification("1", &VerificationUpdate { channel_id: Some(None), ..Default::default() }).unwrap();
+        service.honeypot(&h.message(1, VERIFY, SPAMMER, "spam")).await.unwrap();
+        assert_eq!(h.trace(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn honeypot_deletes_but_reports_a_failure_when_gaia_cannot_kick_the_member() {
+        let (h, service) = live().await;
+        let message = h.message(1, VERIFY, MODERATOR, "hello?");
+        service.honeypot(&message).await.unwrap();
+        assert_eq!(h.trace(), [format!("DELETE /channels/300/messages/{}", message.id)]);
+        let audits = h.audits().await;
+        assert_eq!(audits[0]["title"], "Honeypot Kick Failed");
+        assert!(field(&audits[0], "Reason").unwrap().contains("Kick Members"));
+    }
+
+    #[tokio::test]
+    async fn honeypot_ignores_disabled_verification_and_undeployed_messages() {
+        let (h, service) = live().await;
+        h.repo.update_verification("1", &VerificationUpdate { enabled: Some(0), ..Default::default() }).unwrap();
+        service.honeypot(&h.message(1, VERIFY, SPAMMER, "spam")).await.unwrap();
+        h.repo.update_verification("1", &VerificationUpdate { enabled: Some(1), message_id: Some(None), ..Default::default() }).unwrap();
+        service.honeypot(&h.message(1, VERIFY, SPAMMER, "spam")).await.unwrap();
+        assert_eq!(h.trace(), Vec::<String>::new());
+        assert!(h.audits().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn honeypot_ignores_gaia_staff_and_members_who_can_manage_messages_or_kick() {
+        let (h, service) = live().await;
+        h.repo.replace_staff("1", &[STAFF.to_string()], "2").unwrap();
+        for author in [HELPER, BOUNCER, STAFF] {
+            service.honeypot(&h.message(1, VERIFY, author, "explaining the channel")).await.unwrap();
+        }
+        assert_eq!(h.trace(), Vec::<String>::new());
+        assert!(h.audits().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn honeypot_lookup_never_creates_rows_for_unknown_guilds() {
+        let (h, service) = live().await;
+        service.honeypot(&h.message(2, VERIFY, SPAMMER, "spam")).await.unwrap();
+        assert!(h.repo.verification_lookup("2").unwrap().is_none());
+        assert_eq!(h.trace(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn refuses_to_deploy_into_a_channel_where_everyone_can_send_messages() {
+        let (h, service) = live().await;
+        let config = h.repo.verification("1").unwrap();
+        let channel = |id: u64| h.discord.cache.guild(A).unwrap().channels.get(&ChannelId::new(id)).cloned().unwrap();
+        assert_eq!(service.configuration_error(A, &config, Some(&channel(302))), None);
+        let error = service.configuration_error(A, &config, Some(&channel(303))).unwrap();
+        assert!(error.contains("@everyone can send messages"), "{error}");
     }
 }

@@ -4,7 +4,8 @@ use regex::Regex;
 use std::sync::LazyLock;
 
 static INPUT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(?:(\d{4})-(\d{2})-(\d{2})|(\d{2})\.(\d{2})\.(\d{4}))\s+(\d{2}):(\d{2})$").unwrap()
+    // ASCII digits only: `\d` is Unicode-aware and would accept digits `str::parse` rejects.
+    Regex::new(r"^(?:([0-9]{4})-([0-9]{2})-([0-9]{2})|([0-9]{2})\.([0-9]{2})\.([0-9]{4}))\s+([0-9]{2}):([0-9]{2})$").unwrap()
 });
 
 #[derive(Debug)]
@@ -19,12 +20,13 @@ pub fn long_display(date: DateTime<Utc>) -> String {
 }
 
 pub fn parse_ljubljana_schedule(input: &str, now: DateTime<Utc>) -> Result<Schedule, String> {
-    let c = INPUT
-        .captures(input.trim())
-        .ok_or("Use `YYYY-MM-DD HH:mm` or `DD.MM.YYYY HH:mm` in Europe/Ljubljana.")?;
-    let num = |a: usize, b: usize| -> u32 { c.get(a).or(c.get(b)).unwrap().as_str().parse().unwrap() };
-    let (year, month, day) = (num(1, 6) as i32, num(2, 5), num(3, 4));
-    let (hour, minute) = (num(7, 7), num(8, 8));
+    const FORMAT: &str = "Use `YYYY-MM-DD HH:mm` or `DD.MM.YYYY HH:mm` in Europe/Ljubljana.";
+    let c = INPUT.captures(input.trim()).ok_or(FORMAT)?;
+    let num = |a: usize, b: usize| -> Result<u32, String> {
+        c.get(a).or(c.get(b)).and_then(|m| m.as_str().parse().ok()).ok_or_else(|| FORMAT.to_string())
+    };
+    let (year, month, day) = (num(1, 6)? as i32, num(2, 5)?, num(3, 4)?);
+    let (hour, minute) = (num(7, 7)?, num(8, 8)?);
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 {
         return Err("The date or time is invalid.".into());
     }
@@ -62,5 +64,12 @@ mod tests {
         assert!(parse_ljubljana_schedule("2026-10-25 02:30", now).unwrap_err().contains("ambiguous"));
         assert_eq!(parse_ljubljana_schedule("2026-02-30 10:00", now).unwrap_err(), "The date is invalid.");
         assert!(parse_ljubljana_schedule("2025-07-01 12:00", now).unwrap_err().contains("future"));
+    }
+
+    #[test]
+    fn non_ascii_digits_are_a_format_error_not_a_panic() {
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let err = parse_ljubljana_schedule("٢٠٢٦-٠٧-٠١ ١٢:٠٠", now).unwrap_err();
+        assert!(err.starts_with("Use `YYYY-MM-DD HH:mm`"), "{err}");
     }
 }

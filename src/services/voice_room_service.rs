@@ -17,6 +17,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
 const BRAND: u32 = crate::discord::GAIA_PURPLE;
+const CREATE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
 static ROOM_NAME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^Room (\d+)$").unwrap());
 
 fn compact_ms(started: Instant) -> String {
@@ -109,6 +110,7 @@ pub struct VoiceRoomService {
     accesses: Mutex<HashMap<String, CachedAccess>>,
     configs: Mutex<HashMap<String, GuildConfig>>,
     rename_cooldowns: Mutex<HashMap<String, Instant>>,
+    create_cooldowns: Mutex<HashMap<String, Instant>>,
 }
 
 impl VoiceRoomService {
@@ -121,6 +123,7 @@ impl VoiceRoomService {
             accesses: Mutex::default(),
             configs: Mutex::default(),
             rename_cooldowns: Mutex::default(),
+            create_cooldowns: Mutex::default(),
         }
     }
 
@@ -140,6 +143,7 @@ impl VoiceRoomService {
         self.prefs.lock().unwrap().retain(|k, _| !k.starts_with(&prefix));
         self.accesses.lock().unwrap().retain(|k, _| !k.starts_with(&prefix));
         self.rename_cooldowns.lock().unwrap().retain(|k, _| !k.starts_with(&prefix));
+        self.create_cooldowns.lock().unwrap().retain(|k, _| !k.starts_with(&prefix));
     }
 
     fn voice_channel_of(&self, guild: GuildId, user: UserId) -> Option<ChannelId> {
@@ -189,9 +193,25 @@ impl VoiceRoomService {
                 {
                     return Ok(());
                 }
+                // Join/leave spam would otherwise create and delete a channel per hop. Like a failed
+                // creation, the member just stays in the join channel.
+                if !self.claim_create_cooldown(&format!("{gid}:{}", member.user.id)) {
+                    return Ok(());
+                }
                 self.create_room(guild, &member, new_channel).await
             })
             .await
+    }
+
+    /// One join-to-create room per guild+user every [`CREATE_COOLDOWN`].
+    fn claim_create_cooldown(&self, key: &str) -> bool {
+        let mut cooldowns = self.create_cooldowns.lock().unwrap();
+        cooldowns.retain(|_, at| at.elapsed() < CREATE_COOLDOWN);
+        if cooldowns.contains_key(key) {
+            return false;
+        }
+        cooldowns.insert(key.to_string(), Instant::now());
+        true
     }
 
     pub async fn refresh_guild_config(&self, guild_id: &str) -> anyhow::Result<()> {
@@ -904,5 +924,143 @@ mod tests {
         let plan = room_access_plan("everyone", "owner", 0, &access(), Some("missing-role"), false);
         assert!(plan.contains(&e("everyone", false, false)));
         assert!(!plan.iter().any(|p| p.id == "missing-role"));
+    }
+
+    #[test]
+    fn deny_beats_allow_for_a_user_on_both_lists() {
+        let access = CachedAccess { allowed: vec!["both".into()], denied: vec!["both".into()] };
+        let plan = room_access_plan("everyone", "owner", 0, &access, None, false);
+        assert_eq!(plan, vec![e("everyone", false, false), e("owner", true, false), e("both", false, true)]);
+    }
+
+    // ---- behaviour against the fake Discord ----
+
+    use crate::test_support::{GuildSeed, Harness, BOT_ID};
+    use serde_json::json;
+
+    const G: GuildId = GuildId::new(1);
+    const JOIN: u64 = 200;
+    const ROOM: u64 = 210;
+    const OWNER: u64 = 5;
+    const GUEST: u64 = 6;
+
+    /// Category 100 holds the join channel 200, "Room 1" (210) and "Room 3" (211); members 5 and 6 are human.
+    async fn rooms(voice: &[(u64, u64)]) -> (Harness, Arc<VoiceRoomService>) {
+        let h = Harness::start().await;
+        let mut seed = GuildSeed::new(1, "Guild")
+            .role(20, "Gaia", 10, Permissions::ADMINISTRATOR)
+            .channel(100, ChannelType::Category, None)
+            .channel(JOIN, ChannelType::Voice, Some(100))
+            .channel(ROOM, ChannelType::Voice, Some(100))
+            .channel(211, ChannelType::Voice, Some(100))
+            .bot(&[20])
+            .member(OWNER, &[])
+            .member(GUEST, &[]);
+        for (user, channel) in voice {
+            seed = seed.voice_state(*user, *channel);
+        }
+        for channel in seed.json["channels"].as_array_mut().unwrap() {
+            match channel["id"].as_str().unwrap() {
+                "210" => channel["name"] = json!("Room 1"),
+                "211" => channel["name"] = json!("Room 3"),
+                _ => {}
+            }
+        }
+        h.seed(seed);
+        h.repo.update_setting("1", "voice_rooms_enabled", 1.into()).unwrap();
+        h.repo.set_join_channel("1", Some(&JOIN.to_string())).unwrap();
+        // serenity parses the moved member from the PATCH response.
+        let member = json!({"user": crate::test_support::user_json(OWNER), "roles": [], "joined_at": "2026-01-01T00:00:00.000Z", "deaf": false, "mute": false, "flags": 0, "guild_id": "1"});
+        h.on("PATCH", "/guilds/1/members/5", 200, member);
+        let service = Arc::new(VoiceRoomService::new(h.repo.clone(), h.discord.clone()));
+        (h, service)
+    }
+
+    fn joined(user: u64, channel: u64) -> VoiceState {
+        let member = json!({"user": crate::test_support::user_json(user), "roles": [], "joined_at": "2026-01-01T00:00:00.000Z", "deaf": false, "mute": false, "flags": 0, "guild_id": "1"});
+        serde_json::from_value(json!({
+            "guild_id": "1", "channel_id": channel.to_string(), "user_id": user.to_string(), "member": member,
+            "session_id": "s", "deaf": false, "mute": false, "self_deaf": false, "self_mute": false, "self_video": false,
+            "suppress": false, "request_to_speak_timestamp": null,
+        }))
+        .unwrap()
+    }
+
+    fn active(h: &Harness, channel: u64, owner: u64) {
+        let room = ActiveRoom {
+            guild_id: "1".into(),
+            channel_id: channel.to_string(),
+            owner_id: owner.to_string(),
+            control_channel_id: Some(channel.to_string()),
+            control_message_id: None,
+        };
+        assert!(h.repo.create_room(&room).unwrap());
+    }
+
+    #[tokio::test]
+    async fn join_to_create_makes_the_lowest_free_room_and_moves_the_member_with_a_cooldown() {
+        let (h, service) = rooms(&[(OWNER, JOIN)]).await;
+        service.on_voice_state(None, &joined(OWNER, JOIN)).await.unwrap();
+        let created = h.calls_to("POST", "/guilds/1/channels");
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].body["name"], "Room 2");
+        assert_eq!(created[0].body["type"], 2);
+        assert_eq!(created[0].body["parent_id"], "100");
+        let room = service.repo.active_room_for_owner("1", "5").unwrap().expect("room recorded");
+        let moved = h.calls_to("PATCH", "/guilds/1/members/5");
+        assert_eq!(moved.len(), 1);
+        assert_eq!(moved[0].body["channel_id"], room.channel_id.as_str());
+
+        // The room empties and the owner hops back in at once: no second channel within the cooldown.
+        service.repo.delete_room("1", &room.channel_id).unwrap();
+        service.on_voice_state(Some(&joined(OWNER, 211)), &joined(OWNER, JOIN)).await.unwrap();
+        assert_eq!(h.calls_to("POST", "/guilds/1/channels").len(), 1);
+        assert!(service.repo.active_room_for_owner("1", "5").unwrap().is_none());
+        assert!(service.claim_create_cooldown("1:6"), "the cooldown is per user");
+    }
+
+    #[tokio::test]
+    async fn owner_leaving_hands_the_room_to_a_remaining_human_with_their_preferences() {
+        let (h, service) = rooms(&[(GUEST, ROOM), (BOT_ID, ROOM)]).await;
+        active(&h, ROOM, OWNER);
+        h.repo.update_preference("1", "6", "user_limit", 7.into()).unwrap();
+        service.reconcile_room(G, ChannelId::new(ROOM)).await.unwrap();
+        assert_eq!(h.repo.active_room("1", "210").unwrap().unwrap().owner_id, "6");
+        let limits = h.calls_to("PATCH", "/channels/210");
+        assert_eq!(limits[0].body["user_limit"], 7);
+        let owner_overwrite = h.calls_to("PUT", "/channels/210/permissions/6");
+        assert_eq!(owner_overwrite[0].body["allow"], Permissions::CONNECT.bits().to_string());
+        assert!(h.calls_to("DELETE", "/channels/210").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_room_without_humans_is_deleted() {
+        let (h, service) = rooms(&[(BOT_ID, ROOM)]).await;
+        active(&h, ROOM, OWNER);
+        service.reconcile_room(G, ChannelId::new(ROOM)).await.unwrap();
+        assert_eq!(h.calls_to("DELETE", "/channels/210").len(), 1);
+        assert!(h.repo.active_room("1", "210").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn lock_and_limit_buttons_only_work_for_the_owner() {
+        let (h, service) = rooms(&[(OWNER, ROOM), (GUEST, ROOM)]).await;
+        active(&h, ROOM, OWNER);
+        for action in ["toggle", "limit"] {
+            service.handle_button(&h.button(1, GUEST, &format!("room:{action}:210"))).await.unwrap();
+        }
+        assert!(h.replies().iter().all(|r| r["data"]["content"] == "You are not the current owner of this room."));
+        assert_eq!(h.repo.preference("1", "6").unwrap().is_locked, 0);
+        assert!(h.calls_to("PATCH", "/channels/210").is_empty() && h.calls_to("PUT", "/channels/210/permissions/*").is_empty());
+
+        h.clear_calls();
+        service.handle_button(&h.button(1, OWNER, "room:toggle:210")).await.unwrap();
+        service.handle_button(&h.button(1, OWNER, "room:limit:210")).await.unwrap();
+        let replies = h.replies();
+        assert_eq!(replies[0]["data"]["content"], "Room locked.");
+        assert_eq!(replies[1]["type"], 9, "limit opens a modal");
+        assert_eq!(h.repo.preference("1", "5").unwrap().is_locked, 1);
+        let everyone = h.calls_to("PUT", "/channels/210/permissions/1");
+        assert_eq!(everyone[0].body["deny"], Permissions::CONNECT.bits().to_string());
     }
 }

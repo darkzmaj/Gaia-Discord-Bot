@@ -17,7 +17,7 @@ RUN cargo build --release --locked
 ######################################################################################
 FROM ruby:3.4-slim-bookworm AS runtime
 WORKDIR /app
-ENV BUNDLE_WITHOUT=test BUNDLE_DEPLOYMENT=1
+ENV BUNDLE_WITHOUT=test BUNDLE_DEPLOYMENT=1 BUNDLE_USER_HOME=/tmp/.bundle
 
 RUN groupadd --system gaia && useradd --system --gid gaia --home /app gaia
 

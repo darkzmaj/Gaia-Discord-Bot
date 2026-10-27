@@ -228,6 +228,9 @@ impl MuteService {
         if let Some(message) = check {
             return error(message);
         }
+        if let Some(message) = self.moderator_check(guild, member.user.id, moderator, "mute")? {
+            return error(&message);
+        }
         let guild_id = guild.to_string();
         if self.repo.settings(&guild_id)?.moderation_enabled == 0 {
             return error("Moderation is disabled on this server.");
@@ -288,6 +291,27 @@ impl MuteService {
         Ok(MuteResult { error: None, expires_at: Some(expires_at), dm_delivered: Some(dm_delivered) })
     }
 
+    /// Unless the moderator owns the guild or is a Discord Administrator, the target must sit strictly
+    /// below the moderator's highest role and must not be Gaia staff.
+    fn moderator_check(&self, guild: GuildId, target: UserId, moderator: &Member, verb: &str) -> anyhow::Result<Option<String>> {
+        let below = {
+            let Some(g) = self.discord.cache.guild(guild) else { return Ok(None) };
+            if moderator.user.id == g.owner_id || g.member_permissions(moderator).administrator() {
+                return Ok(None);
+            }
+            // A target who already left has no roles to compare; the staff check below still applies.
+            g.members.get(&target).is_none_or(|t| highest_role(&g, t) < highest_role(&g, moderator))
+        };
+        let staff = self.repo.is_staff(&guild.to_string(), &target.to_string())?;
+        Ok(if !below {
+            Some(format!("🔴 You cannot {verb} a member whose highest role is equal to or above yours."))
+        } else if staff {
+            Some(format!("🔴 You cannot {verb} Gaia staff."))
+        } else {
+            None
+        })
+    }
+
     async fn dm(&self, user: UserId, embed: CreateEmbed) -> bool {
         user.direct_message(&self.discord.http, CreateMessage::new().embed(embed)).await.is_ok()
     }
@@ -320,6 +344,12 @@ impl MuteService {
         let (gid, uid) = (guild.to_string(), user_id.to_string());
         if self.repo.mute(&gid, &uid)?.is_none() {
             return Ok(UnmuteResult::default());
+        }
+        if let Some(message) = match moderator {
+            Some(m) if !automatic => self.moderator_check(guild, user_id, m, "unmute")?,
+            _ => None,
+        } {
+            return Ok(UnmuteResult { error: Some(message), ..Default::default() });
         }
         let guild_name = self.guild_name(guild);
         if self.restore(guild, user_id).await.is_err() {
@@ -494,5 +524,132 @@ mod tests {
         assert!(!sent.contains("Moderator"));
         assert!(!sent.contains("moderator"));
         assert!(sent.contains("<t:1767225660:F>"));
+    }
+
+    use crate::test_support::{GuildSeed, Harness};
+    use serde_json::json;
+
+    const G: GuildId = GuildId::new(1);
+    const TARGET: u64 = 4;
+    const MODERATOR: u64 = 3;
+    const PEER: u64 = 5;
+    const STAFF: u64 = 6;
+    const OWNER: u64 = 2;
+
+    /// Category 100 holds text 200 (target already has an Attach Files overwrite) and voice 201;
+    /// ticket category 101 holds 202, which a mute must never touch.
+    async fn setup() -> (Harness, MuteService) {
+        let h = Harness::start().await;
+        h.seed(
+            GuildSeed::new(1, "Guild")
+                .role(10, "Mod", 5, Permissions::empty())
+                .role(20, "Gaia", 10, Permissions::MANAGE_CHANNELS | Permissions::MANAGE_ROLES)
+                .channel(100, ChannelType::Category, None)
+                .channel(101, ChannelType::Category, None)
+                .channel(200, ChannelType::Text, Some(100))
+                .channel(201, ChannelType::Voice, Some(100))
+                .channel(202, ChannelType::Text, Some(101))
+                .overwrite(200, TARGET, false, Permissions::ATTACH_FILES, Permissions::empty())
+                .bot(&[20])
+                .member(MODERATOR, &[10])
+                .member(TARGET, &[])
+                .member(PEER, &[10])
+                .member(STAFF, &[])
+                .member(OWNER, &[]),
+        );
+        h.repo.update_setting("1", "ticket_category_id", rusqlite::types::Value::Text("101".into())).unwrap();
+        let service = MuteService::new(h.repo.clone(), h.discord.clone(), Some(h.audit.clone()));
+        (h, service)
+    }
+
+    fn overwrite(allow: Permissions, deny: Permissions) -> serde_json::Value {
+        json!({"allow": allow.bits().to_string(), "deny": deny.bits().to_string(), "type": 1})
+    }
+
+    #[tokio::test]
+    async fn mute_then_unmute_applies_and_restores_member_overwrites_outside_ticket_channels() {
+        let (h, service) = setup().await;
+        let (target, moderator) = (h.member(1, TARGET), h.member(1, MODERATOR));
+
+        let muted = service.mute(G, &target, &moderator, 60_000, Some("spam")).await.unwrap();
+        assert_eq!((muted.error, muted.dm_delivered), (None, Some(true)));
+        let puts = h.calls_to("PUT", "/channels/*/permissions/4");
+        let mut touched: Vec<&str> = puts.iter().map(|c| c.path.as_str()).collect();
+        touched.sort();
+        assert_eq!(touched, ["/channels/200/permissions/4", "/channels/201/permissions/4"], "categories and ticket channels are skipped");
+        for call in &puts {
+            let allow = if call.path.contains("/200/") { Permissions::ATTACH_FILES } else { Permissions::empty() };
+            assert_eq!(call.body, overwrite(allow, muted_permissions()), "existing allow bits are kept");
+            assert_eq!(call.reason.as_deref(), Some("Gaia member mute"));
+        }
+        assert!(h.calls().iter().all(|c| !c.path.contains("/channels/202/")));
+        assert_eq!(service.repo.mute_restores("1", "4").unwrap().len(), 2);
+
+        h.clear_calls();
+        let unmuted = service.unmute(G, "4", "appeal", Some(&moderator)).await.unwrap();
+        assert!(unmuted.changed);
+        assert_eq!(unmuted.dm_delivered, Some(true));
+        let restored = h.calls_to("PUT", "/channels/200/permissions/4");
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].body, overwrite(Permissions::ATTACH_FILES, Permissions::empty()));
+        assert_eq!(restored[0].reason.as_deref(), Some("Gaia mute restoration"));
+        let deleted = h.calls_to("DELETE", "/channels/201/permissions/4");
+        assert_eq!(deleted.len(), 1, "an overwrite Gaia created is removed again");
+        assert_eq!(deleted[0].reason.as_deref(), Some("Gaia mute restoration"));
+        assert!(h.calls().iter().all(|c| !c.path.contains("/channels/202/")));
+        assert!(service.repo.mute("1", "4").unwrap().is_none());
+        assert!(service.repo.mute_restores("1", "4").unwrap().is_empty());
+
+        let titles: Vec<_> = h.audits().await.iter().map(|a| a["title"].clone()).collect();
+        assert_eq!(titles, ["Member Muted", "Member Unmuted"]);
+    }
+
+    #[tokio::test]
+    async fn mute_and_unmute_dms_reach_the_member_without_naming_the_moderator() {
+        let (h, service) = setup().await;
+        let (target, moderator) = (h.member(1, TARGET), h.member(1, MODERATOR));
+        service.mute(G, &target, &moderator, 60_000, Some("spam")).await.unwrap();
+        service.unmute(G, "4", "appeal", Some(&moderator)).await.unwrap();
+        let opened = h.calls_to("POST", "/users/@me/channels");
+        assert!(opened.iter().all(|c| c.body["recipient_id"] == "4"));
+        let dms = h.dms();
+        assert_eq!(dms.len(), 2);
+        assert_eq!(dms[0]["embeds"][0]["title"], "🔇 You have been muted");
+        assert_eq!(dms[1]["embeds"][0]["title"], "🔊 You have been unmuted");
+        let sent = serde_json::to_string(&dms).unwrap();
+        assert!(!sent.to_lowercase().contains("moderator"));
+        assert!(!sent.contains("user3"), "moderator's name is not disclosed");
+    }
+
+    #[tokio::test]
+    async fn a_failed_overwrite_rolls_the_mute_back() {
+        let (h, service) = setup().await;
+        h.on("PUT", "/channels/201/permissions/4", 403, json!({"code": 50013, "message": "Missing Permissions"}));
+        let result = service.mute(G, &h.member(1, TARGET), &h.member(1, MODERATOR), 60_000, None).await.unwrap();
+        assert!(result.error.unwrap().contains("could not apply mute channel restrictions"));
+        assert!(service.repo.mute("1", "4").unwrap().is_none());
+        assert_eq!(h.calls_to("PUT", "/channels/200/permissions/4").last().unwrap().body, overwrite(Permissions::ATTACH_FILES, Permissions::empty()));
+        assert!(h.dms().is_empty());
+    }
+
+    #[tokio::test]
+    async fn moderators_cannot_mute_or_unmute_equal_or_higher_members_or_gaia_staff() {
+        let (h, service) = setup().await;
+        h.repo.replace_staff("1", &[STAFF.to_string()], "2").unwrap();
+        let moderator = h.member(1, MODERATOR);
+        let refused = service.mute(G, &h.member(1, PEER), &moderator, 60_000, None).await.unwrap();
+        assert_eq!(refused.error.as_deref(), Some("🔴 You cannot mute a member whose highest role is equal to or above yours."));
+        let refused = service.mute(G, &h.member(1, STAFF), &moderator, 60_000, None).await.unwrap();
+        assert_eq!(refused.error.as_deref(), Some("🔴 You cannot mute Gaia staff."));
+        assert!(h.calls().is_empty() && service.repo.mute("1", "5").unwrap().is_none());
+
+        // The owner bypasses the moderator hierarchy; the moderator then cannot lift it.
+        let owner = h.member(1, OWNER);
+        assert_eq!(service.mute(G, &h.member(1, PEER), &owner, 60_000, None).await.unwrap().error, None);
+        let refused = service.unmute(G, "5", "appeal", Some(&moderator)).await.unwrap();
+        assert!(!refused.changed);
+        assert_eq!(refused.error.as_deref(), Some("🔴 You cannot unmute a member whose highest role is equal to or above yours."));
+        assert!(service.repo.mute("1", "5").unwrap().is_some());
+        assert!(service.unmute(G, "5", "appeal", Some(&owner)).await.unwrap().changed);
     }
 }

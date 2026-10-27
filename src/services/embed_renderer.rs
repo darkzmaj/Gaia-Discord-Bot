@@ -14,6 +14,9 @@ use std::sync::LazyLock;
 
 pub const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_TEMPLATE_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+/// Discord accepts at most 10 files per message, so a template can never usefully hold more.
+pub const MAX_TEMPLATE_ATTACHMENTS: usize = 10;
+pub const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DeliveryMention {
@@ -181,19 +184,72 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex::encode(Sha256::digest(data))
 }
 
+/// The bytes really are the declared (allowed) type: magic numbers for binaries, valid UTF-8 for text.
+pub fn content_matches(content_type: &str, data: &[u8]) -> bool {
+    match content_type {
+        "image/png" => data.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/jpeg" => data.starts_with(&[0xff, 0xd8, 0xff]),
+        "image/gif" => data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a"),
+        "image/webp" => data.len() >= 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WEBP",
+        "application/pdf" => data.starts_with(b"%PDF-"),
+        "text/plain" => std::str::from_utf8(data).is_ok(),
+        _ => false,
+    }
+}
+
+/// Only Discord's own attachment CDN over HTTPS.
+pub fn is_discord_cdn(url: &reqwest::Url) -> bool {
+    url.scheme() == "https"
+        && matches!(url.host_str(), Some("cdn.discordapp.com" | "media.discordapp.net"))
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+}
+
+/// Downloads an upload from an allowed URL without following redirects, streaming with a hard
+/// `max_bytes` cap and a timeout. `allowed` is injectable so tests can use a local server.
+pub async fn download_attachment(url: &str, max_bytes: usize, allowed: impl Fn(&reqwest::Url) -> bool) -> anyhow::Result<Vec<u8>> {
+    let url = reqwest::Url::parse(url).map_err(|_| anyhow!("Attachment URL is invalid."))?;
+    if !allowed(&url) {
+        bail!("Attachment must come from Discord's CDN.");
+    }
+    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).timeout(DOWNLOAD_TIMEOUT).build()?;
+    let mut response = client.get(url).send().await?;
+    if !response.status().is_success() {
+        bail!("Discord attachment download failed.");
+    }
+    let too_large = || anyhow!("Attachment exceeds the {} MB limit.", max_bytes / 1024 / 1024);
+    if response.content_length().is_some_and(|n| n > max_bytes as u64) {
+        return Err(too_large());
+    }
+    let mut data = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if data.len() + chunk.len() > max_bytes {
+            return Err(too_large());
+        }
+        data.extend_from_slice(&chunk);
+    }
+    Ok(data)
+}
+
 pub fn attachment_record(template_id: &str, filename: &str, content_type: &str, data: Vec<u8>, actor: &str) -> anyhow::Result<EmbedAttachment> {
     let clean = sanitize_attachment_filename(filename)?;
-    if !SAFE_MIME.contains(&content_type) {
+    // Discord reports text as `text/plain; charset=utf-8`; parameters are dropped (UTF-8 is verified below).
+    let content_type = content_type.split(';').next().unwrap_or_default().trim().to_ascii_lowercase();
+    if !SAFE_MIME.contains(&content_type.as_str()) {
         bail!("Attachment type is not allowed. Use PNG, JPEG, GIF, WEBP, PDF, or plain text.");
     }
     if data.is_empty() || data.len() > MAX_ATTACHMENT_BYTES {
         bail!("Attachment must be between 1 byte and {} MB.", MAX_ATTACHMENT_BYTES / 1024 / 1024);
     }
+    if !content_matches(&content_type, &data) {
+        bail!("Attachment contents do not match its declared type.");
+    }
     Ok(EmbedAttachment {
         id: uuid::Uuid::new_v4().to_string(),
         template_id: template_id.into(),
         filename: clean,
-        content_type: content_type.into(),
+        content_type,
         size_bytes: data.len() as i64,
         sha256: sha256_hex(&data),
         data,
@@ -202,9 +258,9 @@ pub fn attachment_record(template_id: &str, filename: &str, content_type: &str, 
     })
 }
 
-pub async fn render_template(repo: &GaiaRepository, template_id: &str, payload_json: &str) -> anyhow::Result<RenderedMessage> {
+pub async fn render_template(repo: &GaiaRepository, guild_id: &str, template_id: &str, payload_json: &str) -> anyhow::Result<RenderedMessage> {
     let message = validate_embed_payload(payload_json).map_err(|errors| anyhow!("Template is invalid: {}", errors.join(" ")))?;
-    let attachments = repo.attachments(template_id)?;
+    let attachments = repo.attachments(guild_id, template_id)?;
     if attachments.iter().map(|a| a.size_bytes).sum::<i64>() > MAX_TEMPLATE_ATTACHMENT_BYTES as i64 {
         bail!("Template attachment total exceeds the 20 MB limit.");
     }
@@ -243,6 +299,7 @@ pub async fn render_template(repo: &GaiaRepository, template_id: &str, payload_j
 mod tests {
     use super::*;
     use serde_json::json;
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\nrest";
 
     #[test]
     fn embeds_default_to_gaia_purple() {
@@ -260,11 +317,11 @@ mod tests {
     #[tokio::test]
     async fn stores_attachment_bytes_and_resolves_attachment_urls() {
         let r = repo();
-        r.save_embed("Image", r#"{"embeds":[{"image":{"url":"attachment://card.png"}}]}"#, "admin", None).unwrap();
-        let template = r.embed("Image").unwrap().unwrap();
-        let record = attachment_record(&template.template_id, "card.png", "image/png", b"image".to_vec(), "admin").unwrap();
-        r.save_attachment(&record).unwrap();
-        let rendered = render_template(&r, &template.template_id, &template.payload_json).await.unwrap();
+        r.save_embed("g", "Image", r#"{"embeds":[{"image":{"url":"attachment://card.png"}}]}"#, "admin", None).unwrap();
+        let template = r.embed("g", "Image").unwrap().unwrap();
+        let record = attachment_record(&template.template_id, "card.png", "image/png", PNG.to_vec(), "admin").unwrap();
+        r.save_attachment("g", &record, MAX_TEMPLATE_ATTACHMENTS, MAX_TEMPLATE_ATTACHMENT_BYTES).unwrap();
+        let rendered = render_template(&r, "g", &template.template_id, &template.payload_json).await.unwrap();
         assert_eq!(rendered.files.len(), 1);
         assert_eq!(serde_json::to_value(&rendered.embeds[0]).unwrap()["image"]["url"], "attachment://card.png");
     }
@@ -273,9 +330,9 @@ mod tests {
     async fn rejects_unsafe_attachment_names_and_missing_references() {
         assert!(sanitize_attachment_filename("../secret.png").unwrap_err().to_string().contains("invalid"));
         let r = repo();
-        r.save_embed("Broken", r#"{"embeds":[{"image":{"url":"attachment://missing.png"}}]}"#, "admin", None).unwrap();
-        let template = r.embed("Broken").unwrap().unwrap();
-        let error = render_template(&r, &template.template_id, &template.payload_json).await.unwrap_err();
+        r.save_embed("g", "Broken", r#"{"embeds":[{"image":{"url":"attachment://missing.png"}}]}"#, "admin", None).unwrap();
+        let template = r.embed("g", "Broken").unwrap().unwrap();
+        let error = render_template(&r, "g", &template.template_id, &template.payload_json).await.unwrap_err();
         assert!(error.to_string().contains("missing attachment"));
     }
 
@@ -311,5 +368,85 @@ mod tests {
         assert_eq!(parse_mention(None), no_mention());
         assert_eq!(mention_label(&no_mention()), "None");
         assert_eq!(mention_label(&DeliveryMention { roles: vec!["1".into()], everyone: false, here: true }), "<@&1>, @here");
+    }
+
+    #[test]
+    fn checks_magic_bytes_against_the_declared_type() {
+        assert!(content_matches("image/png", PNG));
+        assert!(content_matches("image/jpeg", &[0xff, 0xd8, 0xff, 0xe0]));
+        assert!(content_matches("image/gif", b"GIF89a.."));
+        assert!(content_matches("image/webp", b"RIFF\0\0\0\0WEBPVP8 "));
+        assert!(content_matches("application/pdf", b"%PDF-1.7"));
+        assert!(content_matches("text/plain", "héllo".as_bytes()));
+        assert!(!content_matches("image/png", b"<html>"));
+        assert!(!content_matches("text/plain", &[0xff, 0xfe, 0x00]));
+        let error = attachment_record("t", "x.png", "image/png", b"MZ\x90\0".to_vec(), "u").unwrap_err();
+        assert!(error.to_string().contains("do not match"));
+        // Discord's `; charset=utf-8` suffix is accepted, and the stored type is the bare MIME type.
+        assert_eq!(attachment_record("t", "x.txt", "text/plain; charset=utf-8", b"hi".to_vec(), "u").unwrap().content_type, "text/plain");
+    }
+
+    #[test]
+    fn only_discord_cdn_https_urls_are_allowed() {
+        let ok = |u: &str| is_discord_cdn(&reqwest::Url::parse(u).unwrap());
+        assert!(ok("https://cdn.discordapp.com/attachments/1/2/a.png?ex=1"));
+        assert!(ok("https://media.discordapp.net/attachments/1/2/a.png"));
+        assert!(!ok("http://cdn.discordapp.com/a.png"));
+        assert!(!ok("https://cdn.discordapp.com.evil.test/a.png"));
+        assert!(!ok("https://127.0.0.1/a.png"));
+        assert!(!ok("https://cdn.discordapp.com:8443/a.png"));
+        assert!(!ok("https://user@cdn.discordapp.com/a.png"));
+    }
+
+    /// Local HTTP server: `/small` (5 bytes), `/big` (declared length 64), `/stream` (no length, 128 bytes
+    /// until close), anything else a redirect to `/small`.
+    async fn file_server() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let response: Vec<u8> = match path.as_str() {
+                        "/small" => b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello".to_vec(),
+                        "/big" => [&b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\nConnection: close\r\n\r\n"[..], &[b'a'; 64]].concat(),
+                        "/stream" => [&b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n"[..], &[b'a'; 128]].concat(),
+                        _ => b"HTTP/1.1 302 Found\r\nLocation: /small\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+                    };
+                    let _ = socket.write_all(&response).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        base
+    }
+
+    #[tokio::test]
+    async fn downloads_with_host_check_byte_cap_and_no_redirects() {
+        let base = file_server().await;
+        let any = |_: &reqwest::Url| true;
+        assert_eq!(download_attachment(&format!("{base}/small"), 32, any).await.unwrap(), b"hello");
+        let big = download_attachment(&format!("{base}/big"), 32, any).await.unwrap_err();
+        assert!(big.to_string().contains("exceeds"), "{big}");
+        let stream = download_attachment(&format!("{base}/stream"), 32, any).await.unwrap_err();
+        assert!(stream.to_string().contains("exceeds"), "{stream}");
+        assert!(download_attachment(&format!("{base}/redirect"), 32, any).await.is_err(), "redirects are not followed");
+        let host = download_attachment(&format!("{base}/small"), 32, is_discord_cdn).await.unwrap_err();
+        assert!(host.to_string().contains("Discord's CDN"));
+    }
+
+    #[tokio::test]
+    async fn renders_only_the_owning_guilds_attachments() {
+        let r = repo();
+        r.save_embed("g", "Image", r#"{"embeds":[{"image":{"url":"attachment://card.png"}}]}"#, "admin", None).unwrap();
+        let template = r.embed("g", "Image").unwrap().unwrap();
+        let record = attachment_record(&template.template_id, "card.png", "image/png", PNG.to_vec(), "admin").unwrap();
+        r.save_attachment("g", &record, MAX_TEMPLATE_ATTACHMENTS, MAX_TEMPLATE_ATTACHMENT_BYTES).unwrap();
+        let error = render_template(&r, "other", &template.template_id, &template.payload_json).await.unwrap_err();
+        assert!(error.to_string().contains("missing attachment"));
     }
 }

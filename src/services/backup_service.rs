@@ -30,6 +30,11 @@ use tokio::task::JoinHandle;
 pub const BACKUP_SCHEMA_VERSION: i64 = 2;
 pub const MAX_BACKUP_BYTES: usize = 25 * 1024 * 1024;
 pub const MAX_GUILD_ASSET_BYTES: usize = 8 * 1024 * 1024;
+/// Discord's own role icon upload limit.
+pub const MAX_ROLE_ICON_BYTES: usize = 256 * 1024;
+/// Hosts Gaia downloads guild/role images from. Anything else is refused before a request is made.
+const ASSET_HOSTS: [&str; 2] = ["cdn.discordapp.com", "media.discordapp.net"];
+const IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 
 const CATEGORY: u64 = 4;
 const ANNOUNCEMENT: u64 = 5;
@@ -624,6 +629,50 @@ fn cdn(path: &str, id: &str, hash: Option<&str>, dynamic: bool) -> Option<String
     Some(format!("https://cdn.discordapp.com/{path}/{id}/{hash}.{ext}?size=4096"))
 }
 
+/// Only https URLs on Discord's CDN hosts (default port, no credentials) may be fetched.
+fn asset_url(url: &str) -> anyhow::Result<reqwest::Url> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| anyhow::anyhow!("Asset URL is invalid."))?;
+    let allowed = parsed.scheme() == "https"
+        && parsed.port().is_none()
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.host_str().is_some_and(|host| ASSET_HOSTS.contains(&host));
+    if !allowed {
+        anyhow::bail!("Asset URL is not on Discord's CDN.");
+    }
+    Ok(parsed)
+}
+
+/// GETs an image with `client` (built without redirects), accepting only [`IMAGE_TYPES`] and at most `max`
+/// bytes. The body is streamed and capped as it arrives; Content-Length is not trusted.
+async fn download_image(client: &reqwest::Client, url: reqwest::Url, max: usize) -> anyhow::Result<(String, Vec<u8>)> {
+    let mut response = client.get(url).send().await?;
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(';').next().unwrap_or_default().trim().to_lowercase())
+        .unwrap_or_default();
+    if !response.status().is_success() || !IMAGE_TYPES.contains(&content_type.as_str()) {
+        anyhow::bail!("Discord did not provide a supported image response.");
+    }
+    let limit = if max >= 1024 * 1024 { format!("{} MB", max / 1024 / 1024) } else { format!("{} KB", max / 1024) };
+    if response.content_length().is_some_and(|n| n > max as u64) {
+        anyhow::bail!("Asset exceeds {limit}.");
+    }
+    let mut data = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if data.len() + chunk.len() > max {
+            anyhow::bail!("Asset exceeds {limit}.");
+        }
+        data.extend_from_slice(&chunk);
+    }
+    if data.is_empty() {
+        anyhow::bail!("Asset must be between 1 byte and {limit}.");
+    }
+    Ok((content_type, data))
+}
+
 // ---------------------------------------------------------------- live Discord state (REST)
 
 /// Raw Discord REST view of a guild: guild JSON (with roles), channels and the bot member.
@@ -864,7 +913,12 @@ impl BackupService {
             member_syncs: Mutex::default(),
             member_snapshots: Mutex::default(),
             timer: Mutex::default(),
-            client: reqwest::Client::builder().timeout(Duration::from_secs(20)).build().unwrap_or_default(),
+            // No redirects: an allowlisted CDN URL must not be able to bounce the request elsewhere.
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(20))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("reqwest client"),
         }
     }
 
@@ -1034,7 +1088,21 @@ impl BackupService {
         if let Some(source) = source {
             return self.is_admin(source, user_id).await;
         }
-        backup.creation_type == "manual" && backup.created_by.as_deref() == Some(user_id)
+        // Documented fallback: once Gaia has left the source guild, only the creator of a manual backup keeps access.
+        let creator = backup.creation_type == "manual" && backup.created_by.as_deref() == Some(user_id);
+        if creator {
+            self.record(AuditEvent {
+                title: "Backup Accessed By Creator Fallback".into(),
+                category: "Backups".into(),
+                color: "warning".into(),
+                guild: Some(AuditSubject::named(backup.source_guild_id.clone(), backup.source_guild_name.clone())),
+                actor: Some(AuditSubject::id(user_id)),
+                reason: Some("Gaia is no longer in the source guild, so Administrator access could not be checked.".into()),
+                details: vec![("Backup".into(), json!(backup.backup_id))],
+                ..Default::default()
+            });
+        }
+        creator
     }
 
     fn member_cache_is_complete(&self, guild_id: GuildId, count: usize) -> bool {
@@ -1046,10 +1114,14 @@ impl BackupService {
         let started = Instant::now();
         let key = guild_id.to_string();
         let elapsed = |s: Instant| s.elapsed().as_millis() as i64;
-        if let Some((members, expires)) = self.member_snapshots.lock().unwrap().get(&key).cloned() {
-            if expires > Instant::now() {
-                return Ok(AcquiredMembers { members, source: "cache", duration_ms: elapsed(started) });
-            }
+        let cached = {
+            let mut snapshots = self.member_snapshots.lock().unwrap();
+            // Evict every expired snapshot, not just this guild's, so the map cannot outgrow active backups.
+            snapshots.retain(|_, (_, expires)| *expires > started);
+            snapshots.get(&key).map(|(members, _)| members.clone())
+        };
+        if let Some(members) = cached {
+            return Ok(AcquiredMembers { members, source: "cache", duration_ms: elapsed(started) });
         }
         let live: Option<(Vec<MemberEntry>, u64)> =
             self.discord.cache.guild(guild_id).map(|g| (g.members.values().map(MemberEntry::from).collect(), g.member_count));
@@ -1124,13 +1196,23 @@ impl BackupService {
         }
     }
 
-    pub async fn available_to(&self, user_id: &str) -> anyhow::Result<Vec<GuildBackup>> {
-        let mut result = Vec::new();
-        for backup in self.repo.all_backups()? {
-            if self.can_access(&backup, user_id).await {
-                result.push(backup);
-            }
+    /// Backups of `current` (the caller already checked Administrator there) and of every other cached guild
+    /// where the user is currently an Administrator. Cache plus per-guild queries only, so it fits Discord's
+    /// 3-second interaction window. Creator-fallback backups (source guild no longer cached) are not listed.
+    pub fn available_to(&self, user_id: UserId, current: GuildId) -> anyhow::Result<Vec<GuildBackup>> {
+        let cache = &self.discord.cache;
+        let admin = |id: GuildId| {
+            let member = cache.guild(id).and_then(|g| g.members.get(&user_id).cloned());
+            member.is_some_and(|m| is_administrator(&self.discord, &m))
+        };
+        let mut result = self.repo.backups(&current.to_string())?;
+        for guild_id in cache.guilds().into_iter().filter(|id| *id != current && admin(*id)) {
+            result.extend(self.repo.backups(&guild_id.to_string())?);
         }
+        // Creator fallback: manual backups of guilds Gaia no longer belongs to.
+        let gone = |b: &GuildBackup| b.source_guild_id.parse().map_or(true, |id: u64| cache.guild(GuildId::new(id)).is_none());
+        result.extend(self.repo.manual_backups_created_by(&user_id.to_string())?.into_iter().filter(gone));
+        result.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         Ok(result)
     }
 
@@ -1692,26 +1774,7 @@ impl BackupService {
     }
 
     async fn download_asset(&self, url: &str) -> anyhow::Result<(String, Vec<u8>)> {
-        let response = self.client.get(url).send().await?;
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.split(';').next().unwrap_or_default().trim().to_lowercase())
-            .unwrap_or_default();
-        let advertised = response.content_length().unwrap_or(0) as usize;
-        if !response.status().is_success() || !["image/png", "image/jpeg", "image/webp", "image/gif"].contains(&content_type.as_str()) {
-            anyhow::bail!("Discord did not provide a supported image response.");
-        }
-        let mb = MAX_GUILD_ASSET_BYTES / 1024 / 1024;
-        if advertised > MAX_GUILD_ASSET_BYTES {
-            anyhow::bail!("Asset exceeds {mb} MB.");
-        }
-        let data = response.bytes().await?.to_vec();
-        if data.is_empty() || data.len() > MAX_GUILD_ASSET_BYTES {
-            anyhow::bail!("Asset must be between 1 byte and {mb} MB.");
-        }
-        Ok((content_type, data))
+        download_image(&self.client, asset_url(url)?, MAX_GUILD_ASSET_BYTES).await
     }
 
     async fn capture_guild_assets(
@@ -1765,17 +1828,7 @@ impl BackupService {
 
     /// Resolves a URL (role icon) to a data URI like discord.js `DataResolver.resolveImage`.
     async fn data_uri(&self, url: &str) -> anyhow::Result<String> {
-        let response = self.client.get(url).send().await?.error_for_status()?;
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("image/png")
-            .split(';')
-            .next()
-            .unwrap_or("image/png")
-            .to_string();
-        let data = response.bytes().await?;
+        let (content_type, data) = download_image(&self.client, asset_url(url)?, MAX_ROLE_ICON_BYTES).await?;
         Ok(format!("data:{content_type};base64,{}", base64::engine::general_purpose::STANDARD.encode(&data)))
     }
 
@@ -3138,5 +3191,608 @@ mod tests {
             json!({ "name": "f", "type": 15, "parent_id": "9", "nsfw": false, "rate_limit_per_user": 0,
                 "available_tags": [{ "name": "t", "moderated": true, "emoji_id": null, "emoji_name": "x" }] })
         );
+    }
+}
+
+/// Behavioural tests over the fake Discord REST harness (`crate::test_support`).
+#[cfg(test)]
+mod harness_tests {
+    use super::*;
+    use crate::test_support::{role_json, GuildSeed, Harness, BOT_ID};
+    use serenity::all::Permissions;
+
+    const G: u64 = 1;
+    const ADMIN: u64 = 5;
+
+    /// A repository plus a second connection to the same in-memory database, for asserting on rows
+    /// the repository has no getter for.
+    fn shared_repo() -> (Arc<GaiaRepository>, rusqlite::Connection) {
+        use rusqlite::OpenFlags;
+        let uri = format!("file:gaia-{}?mode=memory&cache=shared", uuid::Uuid::new_v4());
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_URI;
+        let mut conn = rusqlite::Connection::open_with_flags(&uri, flags).unwrap();
+        crate::db::migrate(&mut conn).unwrap();
+        let reader = rusqlite::Connection::open_with_flags(&uri, flags).unwrap();
+        (Arc::new(GaiaRepository::new(conn)), reader)
+    }
+
+    fn service(h: &Harness, repo: Arc<GaiaRepository>) -> BackupService {
+        BackupService::new(repo, h.discord.clone(), Some(h.audit.clone()))
+    }
+
+    /// Guild `id` cached with Gaia and an Administrator, user 5.
+    fn seed(h: &Harness, id: u64) {
+        h.seed(GuildSeed::new(id, "Guild").role(40, "Admin", 5, Permissions::ADMINISTRATOR).bot(&[]).member(ADMIN, &[40]));
+    }
+
+    /// REST view of guild 1: Gaia (BOT_ID) owns it, so every hierarchy/permission check passes.
+    fn raw_guild(extra: Value) -> Value {
+        let mut guild = GuildSeed::new(G, "Guild").json;
+        guild["owner_id"] = json!(BOT_ID.to_string());
+        for (key, value) in extra.as_object().unwrap() {
+            guild[key] = value.clone();
+        }
+        guild
+    }
+
+    fn destination(h: &Harness, raw: Value, channels: Value) {
+        // Discord answers a channel delete with the deleted channel.
+        h.on("DELETE", "/channels/*", 200, channel(999, 0, "deleted", None));
+        h.on("GET", "/guilds/1", 200, raw.clone());
+        h.on("PATCH", "/guilds/1", 200, raw);
+        h.on("GET", "/guilds/1/channels", 200, channels);
+    }
+
+    fn channel(id: u64, kind: u64, name: &str, parent: Option<u64>) -> Value {
+        json!({"id": id.to_string(), "type": kind, "guild_id": "1", "name": name, "position": 0, "permission_overwrites": [],
+            "parent_id": parent.map(|p| p.to_string()), "nsfw": false})
+    }
+
+    fn snapshot(guild: Value, roles: Vec<Value>, channels: Vec<Value>) -> Snapshot {
+        Snapshot { schema_version: BACKUP_SCHEMA_VERSION, guild, roles, channels, members: vec![], gaia: Value::Null, unsupported: None }
+    }
+
+    fn run(svc: &BackupService) -> Run<'_> {
+        let now = now_ms();
+        Run {
+            svc,
+            guild_id: GuildId::new(G),
+            key: G.to_string(),
+            dest_name: "Destination".into(),
+            backup: GuildBackup {
+                backup_id: "backup".into(),
+                source_guild_name: "Source".into(),
+                created_at: "2026-01-01T00:00:00.000Z".into(),
+                ..Default::default()
+            },
+            restore_id: "restore".into(),
+            user_id: ADMIN.to_string(),
+            started_at_ms: now,
+            last_progress_at_ms: now,
+            phase_started_at_ms: now,
+            phase: "roles".into(),
+            phase_timings: vec![],
+            operation: None,
+            warnings: vec![],
+            critical: vec![],
+            role_map: OrderedMap::default(),
+            channel_map: OrderedMap::default(),
+            counts: Counts::default(),
+            safety_backup_id: None,
+            destructive: false,
+            unremovable: vec![],
+            member_ids: HashSet::new(),
+            report: None,
+            dm: RestoreProgressDm { attempted: false, message: None, last_edit_at: 0, phase: None, phase_started_at: now },
+        }
+    }
+
+    fn stored(repo: &GaiaRepository, id: &str, guild: &str, created_by: &str) -> GuildBackup {
+        let value = json!({
+            "schemaVersion": BACKUP_SCHEMA_VERSION,
+            "guild": { "id": guild, "name": "Source", "everyonePermissions": "0" },
+            "roles": [], "channels": [], "members": [], "gaia": {},
+        })
+        .to_string();
+        let backup = GuildBackup {
+            backup_id: id.into(),
+            source_guild_id: guild.into(),
+            source_guild_name: "Source".into(),
+            created_at: "2026-01-01T00:00:00.000Z".into(),
+            created_by: Some(created_by.into()),
+            creation_type: "manual".into(),
+            snapshot_schema_version: BACKUP_SCHEMA_VERSION,
+            snapshot_hash: sha256_hex(value.as_bytes()),
+            snapshot_size: value.len() as i64,
+            snapshot_json: value,
+            ..Default::default()
+        };
+        repo.store_backup(&backup, None, None).unwrap();
+        backup
+    }
+
+    /// Every non-GET guild call and every DELETE: what a restore must not do before its safety backup.
+    fn mutations(h: &Harness) -> Vec<String> {
+        h.trace().into_iter().filter(|c| (c.contains("/guilds/") || c.starts_with("DELETE")) && !c.starts_with("GET")).collect()
+    }
+
+    // ---- fixes
+
+    #[test]
+    fn only_fetches_https_discord_cdn_urls() {
+        for ok in ["https://cdn.discordapp.com/icons/1/abc.webp?size=4096", "https://media.discordapp.net/role-icons/2/x.png"] {
+            assert!(asset_url(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://cdn.discordapp.com/icons/1/abc.webp",
+            "https://cdn.discordapp.com.evil.test/icons/1/abc.webp",
+            "https://evil.test/cdn.discordapp.com/x.png",
+            "https://cdn.discordapp.com:8443/icons/1/abc.webp",
+            "https://user:pass@cdn.discordapp.com/icons/1/abc.webp",
+            "https://127.0.0.1/x.png",
+            "file:///etc/passwd",
+            "not a url",
+        ] {
+            assert!(asset_url(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// Raw HTTP server (no Content-Length; the body ends when the socket closes).
+    async fn image_server() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let path = String::from_utf8_lossy(&buf[..n]).split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let (head, body): (&str, Vec<u8>) = match path.as_str() {
+                        "/icon.png" => ("200 OK\r\nContent-Type: image/png", b"icon-bytes".to_vec()),
+                        "/huge.png" => ("200 OK\r\nContent-Type: image/png", vec![7; MAX_ROLE_ICON_BYTES + 1]),
+                        "/page.html" => ("200 OK\r\nContent-Type: text/html", b"<html></html>".to_vec()),
+                        _ => ("302 Found\r\nLocation: /icon.png\r\nContent-Type: image/png", vec![]),
+                    };
+                    let _ = socket.write_all(format!("HTTP/1.1 {head}\r\nConnection: close\r\n\r\n").as_bytes()).await;
+                    let _ = socket.write_all(&body).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        base
+    }
+
+    #[tokio::test]
+    async fn downloads_images_with_a_streamed_cap_type_allowlist_and_no_redirects() {
+        let h = Harness::start().await;
+        let svc = service(&h, h.repo.clone());
+        let base = image_server().await;
+        let get = |path: &str| download_image(&svc.client, reqwest::Url::parse(&format!("{base}{path}")).unwrap(), MAX_ROLE_ICON_BYTES);
+        assert_eq!(get("/icon.png").await.unwrap(), ("image/png".to_string(), b"icon-bytes".to_vec()));
+        assert!(get("/huge.png").await.unwrap_err().to_string().contains("exceeds 256 KB"));
+        assert!(get("/page.html").await.unwrap_err().to_string().contains("supported image"));
+        assert!(get("/redirect").await.unwrap_err().to_string().contains("supported image"), "redirects are not followed");
+        // The URL allowlist runs before any request: a non-CDN role icon never reaches the network.
+        assert!(svc.data_uri(&format!("{base}/icon.png")).await.unwrap_err().to_string().contains("Discord's CDN"));
+    }
+
+    #[tokio::test]
+    async fn evicts_expired_member_snapshots() {
+        let h = Harness::start().await;
+        seed(&h, G);
+        let svc = service(&h, h.repo.clone());
+        let past = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+        svc.member_snapshots.lock().unwrap().insert("777".into(), (Arc::new(vec![]), past));
+        svc.acquire_members(GuildId::new(G)).await.unwrap();
+        let snapshots = svc.member_snapshots.lock().unwrap();
+        assert!(!snapshots.contains_key("777"), "an expired snapshot of another guild is evicted");
+        assert!(snapshots.contains_key("1"));
+    }
+
+    #[tokio::test]
+    async fn lists_only_backups_of_guilds_the_user_administers_without_rest_calls() {
+        let h = Harness::start().await;
+        seed(&h, G);
+        seed(&h, 2);
+        h.seed(GuildSeed::new(3, "Other").member(ADMIN, &[]));
+        let (repo, _reader) = shared_repo();
+        for (id, guild) in [("current", "1"), ("admin", "2"), ("member", "3"), ("gone", "4")] {
+            stored(&repo, id, guild, &ADMIN.to_string());
+        }
+        let svc = service(&h, repo);
+        let listed: Vec<String> = svc.available_to(UserId::new(ADMIN), GuildId::new(G)).unwrap().into_iter().map(|b| b.backup_id).collect();
+        // "member": guild 3 is cached but ADMIN is not an admin there; "gone": Gaia left guild 4, ADMIN created it.
+        assert_eq!(listed.len(), 3, "{listed:?}");
+        assert!(listed.contains(&"current".into()) && listed.contains(&"admin".into()) && listed.contains(&"gone".into()));
+        assert!(svc.available_to(UserId::new(6), GuildId::new(3)).unwrap().iter().all(|b| b.source_guild_id == "3"));
+        assert_eq!(h.trace(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn audits_the_creator_fallback_only_when_it_grants_access() {
+        let h = Harness::start().await;
+        let (repo, _reader) = shared_repo();
+        stored(&repo, "orphan", "77", &ADMIN.to_string());
+        let svc = service(&h, repo);
+        assert!(svc.preview("orphan", GuildId::new(G), "6").await.unwrap_err().to_string().contains("not authorized"));
+        assert!(h.audits().await.is_empty());
+        svc.preview("orphan", GuildId::new(G), &ADMIN.to_string()).await.unwrap();
+        let audits = h.audits().await;
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0]["title"], "Backup Accessed By Creator Fallback");
+    }
+
+    // ---- ported from business.test.ts
+
+    #[tokio::test]
+    async fn captures_only_ordinary_roles_excluding_everyone_and_managed_integrations() {
+        let h = Harness::start().await;
+        let svc = service(&h, h.repo.clone());
+        let mut ordinary = role_json(30, "Ordinary", 1, Permissions::empty());
+        ordinary["permissions"] = json!("900719925474099312345");
+        ordinary["colors"]["primary_color"] = json!(0x5865f2);
+        let mut managed = role_json(31, "Integration", 2, Permissions::empty());
+        managed["managed"] = json!(true);
+        // SuppressJoinNotifications | SuppressRoleSubscriptionPurchaseNotifications
+        let raw = raw_guild(json!({"roles": [role_json(G, "@everyone", 0, Permissions::empty()), ordinary, managed], "system_channel_flags": 17}));
+        let state = GuildState { id: G.to_string(), raw, channels: vec![], me: None };
+        let (snapshot, assets) = svc.capture(&state, "backup", &[]).await.unwrap();
+        assert_eq!(snapshot.roles.len(), 1);
+        assert_eq!(snapshot.roles[0]["id"], "30");
+        assert_eq!(snapshot.roles[0]["permissions"], "900719925474099312345");
+        assert_eq!(snapshot.guild["systemChannelFlags"], "17");
+        assert_eq!(system_channel_flags_from_snapshot(&snapshot.guild["systemChannelFlags"]).unwrap(), 17);
+        assert!(assets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn does_not_add_a_downstream_hierarchy_error_when_role_creation_left_no_mapping() {
+        let h = Harness::start().await;
+        seed(&h, G);
+        destination(&h, raw_guild(json!({})), json!([]));
+        let svc = service(&h, h.repo.clone());
+        let mut run = run(&svc);
+        run.apply_role_hierarchy(&snapshot(json!({}), vec![json!({"id": "failed", "name": "Failed", "position": 1})], vec![])).await.unwrap();
+        assert!(run.critical.is_empty());
+    }
+
+    #[tokio::test]
+    async fn records_a_failed_safety_backup_before_any_destination_mutation() {
+        let h = Harness::start().await;
+        seed(&h, G);
+        seed(&h, 10);
+        let (repo, reader) = shared_repo();
+        stored(&repo, "source-backup", "10", "someone");
+        // The safety backup's guild fetch fails.
+        h.on("GET", "/guilds/1", 500, json!({"code": 0, "message": "safety snapshot failed"}));
+        let svc = service(&h, repo);
+        let error = svc.restore("source-backup", GuildId::new(G), &ADMIN.to_string(), None).await.unwrap_err();
+        assert!(error_text(&error).contains("safety snapshot failed"), "{error}");
+        assert_eq!(mutations(&h), Vec::<String>::new());
+        let row: (String, String) = reader
+            .query_row("SELECT status,current_phase FROM restore_operations WHERE destination_guild_id='1'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(row, ("failed".into(), "safety backup".into()));
+        assert!(!svc.active_restore_destinations().contains(&"1".into()));
+    }
+
+    #[tokio::test]
+    async fn deletes_restorable_destination_state_children_first_while_preserving_gaia_and_managed_roles() {
+        let h = Harness::start().await;
+        // Role#editable has no owner bypass: Gaia's own role must sit above the roles it deletes.
+        h.seed(GuildSeed::new(G, "Guild").bot(&[20]));
+        let mut managed = role_json(31, "integration", 2, Permissions::empty());
+        managed["managed"] = json!(true);
+        let mut gaia = role_json(20, "Gaia", 3, Permissions::empty());
+        gaia["tags"] = json!({"bot_id": BOT_ID.to_string()});
+        let roles = json!([role_json(G, "@everyone", 0, Permissions::empty()), role_json(30, "old-role", 1, Permissions::empty()), managed, gaia]);
+        let channels = json!([channel(101, 4, "old-category", None), channel(100, 0, "old-channel", Some(101))]);
+        destination(&h, raw_guild(json!({"roles": roles})), channels);
+        let svc = service(&h, h.repo.clone());
+        let mut run = run(&svc);
+        run.delete_destination_state().await.unwrap();
+        assert_eq!(mutations(&h), ["DELETE /channels/100", "DELETE /channels/101", "DELETE /guilds/1/roles/30"]);
+        assert!(run.critical.is_empty());
+    }
+
+    #[tokio::test]
+    async fn records_an_actual_sanitized_discord_channel_error_as_critical_restore_state() {
+        let h = Harness::start().await;
+        h.on("POST", "/guilds/1/channels", 403, json!({"code": 50013, "message": "Missing Permissions"}));
+        let svc = service(&h, h.repo.clone());
+        let mut run = run(&svc);
+        let news = json!({"id": "news", "name": "news", "type": 5, "parentId": null});
+        run.create_channels(&[&news], "Announcement channels").await;
+        assert_eq!(run.critical, ["Channel news could not be created — Discord error 50013: Missing Permissions"]);
+    }
+
+    #[tokio::test]
+    async fn enables_community_with_mapped_rules_and_updates_channels() {
+        let h = Harness::start().await;
+        seed(&h, G);
+        destination(&h, raw_guild(json!({})), json!([]));
+        let svc = service(&h, h.repo.clone());
+        let mut run = run(&svc);
+        run.channel_map.set("rules", "501".into());
+        run.channel_map.set("updates", "502".into());
+        let guild = json!({"communityEnabled": true, "rulesChannelId": "rules", "publicUpdatesChannelId": "updates"});
+        run.restore_community(&snapshot(guild, vec![], vec![])).await.unwrap();
+        let edits = h.calls_to("PATCH", "/guilds/1");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].body, json!({"features": ["COMMUNITY"], "rules_channel_id": "501", "public_updates_channel_id": "502"}));
+        assert!(run.critical.is_empty(), "{:?}", run.critical);
+    }
+
+    #[tokio::test]
+    async fn moves_community_references_before_deleting_a_stale_protected_rules_channel() {
+        let h = Harness::start().await;
+        seed(&h, G);
+        let community = |rules: &str, updates: &str| {
+            raw_guild(json!({"features": ["COMMUNITY"], "rules_channel_id": rules, "public_updates_channel_id": updates}))
+        };
+        let (rules, updates) = (channel(501, 0, "rules", None), channel(502, 0, "updates", None));
+        let stale = channel(600, 0, "📌 || about-us", None);
+        destination(&h, community("600", "601"), json!([stale, rules, updates]));
+        let svc = service(&h, h.repo.clone());
+        let mut run = run(&svc);
+        run.channel_map.set("source-rules", "501".into());
+        run.channel_map.set("source-updates", "502".into());
+        let saved = |id: &str, name: &str| json!({"id": id, "name": name, "type": 0, "parentId": null, "overwrites": []});
+        let snap = snapshot(
+            json!({"communityEnabled": true, "rulesChannelId": "source-rules", "publicUpdatesChannelId": "source-updates"}),
+            vec![],
+            vec![saved("source-rules", "rules"), saved("source-updates", "updates")],
+        );
+        // Still the rules channel: protected from deletion.
+        assert!(!run.state().await.unwrap().channel_deletable(&stale));
+        run.restore_community(&snap).await.unwrap();
+        assert_eq!(h.calls_to("PATCH", "/guilds/1")[0].body["rules_channel_id"], "501");
+        // Discord applied the edit.
+        destination(&h, community("501", "502"), json!([stale, rules, updates]));
+        run.cleanup_stale_channels().await.unwrap();
+        assert_eq!(h.calls_to("DELETE", "/channels/*").iter().map(|c| c.path.clone()).collect::<Vec<_>>(), ["/channels/600"]);
+        h.on("GET", "/guilds/1/channels", 200, json!([rules, updates]));
+        run.final_validate(&snap).await.unwrap();
+        assert!(run.critical.is_empty(), "{:?}", run.critical);
+    }
+
+    #[tokio::test]
+    async fn treats_a_post_restore_overwrite_mismatch_as_a_critical_final_validation_failure() {
+        let h = Harness::start().await;
+        seed(&h, G);
+        destination(&h, raw_guild(json!({})), json!([channel(100, 0, "general", None)]));
+        let svc = service(&h, h.repo.clone());
+        let mut run = run(&svc);
+        run.role_map.set("source-everyone", "1".into());
+        run.channel_map.set("source-channel", "100".into());
+        let saved = json!({"id": "source-channel", "type": 0, "name": "general", "parentId": null,
+            "overwrites": [{"id": "source-everyone", "type": 0, "allow": "1", "deny": "0"}]});
+        run.final_validate(&snapshot(json!({}), vec![], vec![saved])).await.unwrap();
+        for expected in [
+            "Final validation: permission overwrite count for general does not match its backup.",
+            "Final validation: permission overwrite for general does not match its backup.",
+        ] {
+            assert!(run.critical.iter().any(|c| c == expected), "{:?}", run.critical);
+        }
+    }
+
+    #[tokio::test]
+    async fn flags_stale_ordinary_roles_channels_and_categories_after_reconstruction() {
+        let h = Harness::start().await;
+        seed(&h, G);
+        let roles = json!([role_json(G, "@everyone", 0, Permissions::empty()), role_json(31, "Stale", 1, Permissions::empty())]);
+        let channels = json!([channel(100, 0, "Stale channel", None), channel(101, 4, "Stale category", None)]);
+        destination(&h, raw_guild(json!({"roles": roles})), channels);
+        let svc = service(&h, h.repo.clone());
+        let mut run = run(&svc);
+        run.final_validate(&snapshot(json!({}), vec![], vec![])).await.unwrap();
+        assert!(run.critical.iter().any(|c| c.contains("unexpected ordinary role")), "{:?}", run.critical);
+        assert!(run.critical.iter().any(|c| c.contains("unexpected channel or categor")), "{:?}", run.critical);
+    }
+
+    #[tokio::test]
+    async fn rejects_a_duplicate_manual_backup_instead_of_starting_a_second_member_request() {
+        let h = Harness::start().await;
+        let svc = service(&h, h.repo.clone());
+        svc.active_backups.lock().unwrap().insert("1".into());
+        let error = svc.create(GuildId::new(G), Some("5"), "manual", None).await.unwrap_err();
+        assert!(error.downcast_ref::<BackupAlreadyRunningError>().is_some());
+        assert!(error.to_string().contains("currently being created"));
+        assert_eq!(h.trace(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn does_not_start_an_automatic_backup_while_a_manual_backup_is_active() {
+        let h = Harness::start().await;
+        seed(&h, G);
+        h.repo.update_backup_settings("1", &BackupSettingsUpdate { automatic_enabled: Some(1), ..Default::default() }).unwrap();
+        let svc = service(&h, h.repo.clone());
+        svc.active_backups.lock().unwrap().insert("1".into());
+        svc.run_automatic(DateTime::parse_from_rfc3339("2026-08-26T03:30:00.000Z").unwrap().with_timezone(&Utc)).await.unwrap();
+        assert_eq!(h.trace(), Vec::<String>::new());
+        assert_eq!(h.repo.backup_settings("1").unwrap().last_attempt_at, None);
+    }
+
+    #[tokio::test]
+    async fn releases_the_per_guild_backup_lock_after_member_synchronization_failure() {
+        let h = Harness::start().await;
+        let mut guild = GuildSeed::new(G, "Guild").bot(&[]);
+        guild.json["member_count"] = json!(5);
+        h.seed(guild);
+        h.on("GET", "/guilds/1/members", 500, json!({"code": 0, "message": "member sync failed"}));
+        let svc = service(&h, h.repo.clone());
+        for attempt in 1..=2 {
+            let error = svc.create(GuildId::new(G), Some("5"), "manual", None).await.unwrap_err();
+            assert!(error.to_string().contains("member sync failed"), "{error}");
+            assert!(!svc.active_backups.lock().unwrap().contains("1"));
+            assert_eq!(h.calls_to("GET", "/guilds/1/members").len(), attempt, "the lock was released for the next attempt");
+        }
+    }
+
+    // ---- restore completion notifications and guild identity
+
+    fn completed_operation(repo: &GaiaRepository) {
+        stored(repo, "backup", "source", "admin");
+        repo.create_restore_operation(&NewRestoreOperation {
+            restore_id: "restore".into(),
+            backup_id: "backup".into(),
+            destination_guild_id: "1".into(),
+            requested_by: ADMIN.to_string(),
+            executor_user_id: Some(ADMIN.to_string()),
+            status: "completed".into(),
+            current_phase: "complete".into(),
+            progress_json: "{}".into(),
+            errors_json: "[]".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        repo.update_restore_operation("restore", &RestoreOperationUpdate { completed: Some(true), ..Default::default() }).unwrap();
+    }
+
+    fn result(status: &str, warnings: &[&str]) -> RestoreResult {
+        RestoreResult {
+            restore_id: "restore".into(),
+            status: status.into(),
+            warnings: warnings.iter().map(|w| w.to_string()).collect(),
+            critical_failures: if status == "failed" { vec!["safety backup — denied".into()] } else { vec![] },
+            phase_timings_ms: vec![],
+            safety_backup_id: Some("safety".into()),
+            roles: 2,
+            channels: 3,
+            overwrites: 4,
+            members: 5,
+        }
+    }
+
+    fn identity() -> Snapshot {
+        let guild = json!({"id": "source", "name": "Deforged Games", "description": "Restored description", "communityEnabled": true,
+            "assets": {"icon": {"state": "absent"}}});
+        snapshot(guild, vec![], vec![])
+    }
+
+    fn dm_row(reader: &rusqlite::Connection) -> (String, Option<String>, String) {
+        reader
+            .query_row(
+                "SELECT completion_dm_status,completion_dm_failure_reason,executor_user_id FROM restore_operations WHERE restore_id='restore'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sends_exactly_one_green_yellow_red_executor_completion_dm_and_persists_its_outcome() {
+        for (status, warnings, expected) in [
+            ("completed", vec![], "Server Restore Completed"),
+            ("completed_with_warnings", vec!["banner unavailable"], "Restore Completed With Warnings"),
+            ("failed", vec![], "Server Restore Failed"),
+        ] {
+            let h = Harness::start().await;
+            let (repo, reader) = shared_repo();
+            completed_operation(&repo);
+            let svc = service(&h, repo);
+            let mut run = run(&svc);
+            run.destructive = status == "failed";
+            let result = result(status, &warnings);
+            for _ in 0..2 {
+                svc.notify_completion(&run, &identity(), "2026-01-01T00:00:00.000Z", &result, "complete", None).await;
+            }
+            let dms = h.dms();
+            assert_eq!(dms.len(), 1, "{status}");
+            assert_eq!(dms[0]["embeds"][0]["title"], expected);
+            assert_eq!(dm_row(&reader), ("sent".into(), None, ADMIN.to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn records_dm_delivery_failure_without_changing_the_restore_result() {
+        let h = Harness::start().await;
+        h.on("POST", "/users/@me/channels", 403, json!({"code": 50007, "message": "Cannot send messages to this user"}));
+        let (repo, reader) = shared_repo();
+        completed_operation(&repo);
+        let svc = service(&h, repo);
+        let run = run(&svc);
+        svc.notify_completion(&run, &identity(), "2026-01-01T00:00:00.000Z", &result("completed", &[]), "complete", None).await;
+        let (status, reason, _) = dm_row(&reader);
+        assert_eq!(status, "failed");
+        assert!(reason.unwrap().contains("50007"));
+    }
+
+    #[tokio::test]
+    async fn starts_one_restore_progress_dm_and_edits_that_same_message_into_the_final_result() {
+        let h = Harness::start().await;
+        let (repo, _reader) = shared_repo();
+        completed_operation(&repo);
+        let svc = service(&h, repo);
+        let mut run = run(&svc);
+        let started = now_ms();
+        run.dm = svc.start_restore_progress_dm(&run.backup, GuildId::new(G), "Destination", &ADMIN.to_string(), "restore", started).await;
+        run.update_progress_dm("Roles", Some(2), Some(4), true).await;
+        let started_at = DateTime::from_timestamp_millis(started).unwrap().to_rfc3339();
+        svc.notify_completion(&run, &identity(), &started_at, &result("completed", &[]), "complete", None).await;
+        let dms = h.dms();
+        assert_eq!(dms.len(), 1);
+        assert_eq!(dms[0]["embeds"][0]["title"], "Server Restore Running");
+        let edits = h.calls_to("PATCH", "/channels/*/messages/*");
+        assert_eq!(edits.len(), 2);
+        assert_eq!(edits[1].body["embeds"][0]["title"], "Server Restore Completed");
+    }
+
+    #[tokio::test]
+    async fn treats_a_disabled_executor_dm_as_observability_only() {
+        let h = Harness::start().await;
+        h.on("POST", "/users/@me/channels", 403, json!({"code": 50007, "message": "Cannot send messages to this user"}));
+        let svc = service(&h, h.repo.clone());
+        let mut run = run(&svc);
+        run.dm = svc.start_restore_progress_dm(&run.backup, GuildId::new(G), "Destination", &ADMIN.to_string(), "restore", now_ms()).await;
+        run.update_progress_dm("Roles", None, None, false).await;
+        assert!(run.dm.attempted && run.dm.message.is_none());
+    }
+
+    #[tokio::test]
+    async fn maps_guild_identity_channels_and_makes_an_absent_icon_authoritative() {
+        let h = Harness::start().await;
+        destination(&h, raw_guild(json!({})), json!([]));
+        let svc = service(&h, h.repo.clone());
+        let mut run = run(&svc);
+        for (source, mapped) in [("afk", "11"), ("system", "12"), ("rules", "13"), ("updates", "14"), ("alerts", "15")] {
+            run.channel_map.set(source, mapped.into());
+        }
+        let guild = json!({
+            "name": "Deforged Games", "description": null, "verificationLevel": 3, "explicitContentFilter": 2,
+            "defaultMessageNotifications": 1, "afkTimeout": 300, "afkChannelId": "afk", "systemChannelId": "system",
+            "systemChannelFlags": "0", "rulesChannelId": "rules", "publicUpdatesChannelId": "updates",
+            "safetyAlertsChannelId": "alerts", "preferredLocale": "en-GB", "assets": {"icon": {"state": "absent"}},
+        });
+        run.restore_guild_settings(&snapshot(guild, vec![], vec![]), &[]).await.unwrap();
+        let bodies: Vec<Value> = h.calls_to("PATCH", "/guilds/1").into_iter().map(|c| c.body).collect();
+        for expected in [
+            json!({"name": "Deforged Games"}),
+            json!({"description": null}),
+            json!({"afk_channel_id": "11"}),
+            json!({"system_channel_id": "12"}),
+            json!({"system_channel_flags": 0}),
+            json!({"safety_alerts_channel_id": "15"}),
+            json!({"icon": null}),
+        ] {
+            assert!(bodies.contains(&expected), "{expected} not in {bodies:?}");
+        }
+        assert!(run.critical.is_empty(), "{:?}", run.critical);
+    }
+
+    #[tokio::test]
+    async fn restores_the_retained_icon_binary_rather_than_a_url() {
+        let h = Harness::start().await;
+        destination(&h, raw_guild(json!({})), json!([]));
+        let svc = service(&h, h.repo.clone());
+        let base = image_server().await;
+        let url = reqwest::Url::parse(&format!("{base}/icon.png")).unwrap();
+        let (content_type, data) = download_image(&svc.client, url, MAX_GUILD_ASSET_BYTES).await.unwrap();
+        let asset = GuildBackupAsset { kind: "icon".into(), content_type, size_bytes: data.len() as i64, sha256: sha256_hex(&data), data, ..Default::default() };
+        let mut run = run(&svc);
+        run.restore_guild_assets(&json!({"assets": {"icon": {"state": "captured"}}}), &[asset]).await;
+        let expected = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(b"icon-bytes"));
+        assert_eq!(h.calls_to("PATCH", "/guilds/1")[0].body, json!({"icon": expected}));
     }
 }

@@ -3,6 +3,7 @@
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serenity::all::{
     ButtonStyle, ChannelId, ChannelType, CommandInteraction, ComponentInteraction, ComponentInteractionDataKind,
@@ -288,10 +289,25 @@ fn deployment_token() -> String {
     format!("{}{}", base36(millis), &random[..6.min(random.len())])
 }
 
+/// Pending "Send verification message" confirmations: they expire with the interaction token and are capped.
+const DEPLOYMENT_TTL: Duration = Duration::from_secs(15 * 60);
+const MAX_DEPLOYMENTS: usize = 256;
+
 struct DeploymentSession {
     guild_id: GuildId,
     user_id: UserId,
     channel_id: ChannelId,
+    created: Instant,
+}
+
+fn remember_deployment(sessions: &mut HashMap<String, DeploymentSession>, token: String, session: DeploymentSession) {
+    sessions.retain(|_, s| s.created.elapsed() < DEPLOYMENT_TTL);
+    if sessions.len() >= MAX_DEPLOYMENTS {
+        if let Some(oldest) = sessions.iter().min_by_key(|(_, s)| s.created).map(|(k, _)| k.clone()) {
+            sessions.remove(&oldest);
+        }
+    }
+    sessions.insert(token, session);
 }
 
 /// Interaction details shared by buttons, selects and modals.
@@ -427,7 +443,7 @@ impl AdminUi {
                         )
                         .await
                 }
-                "view" | "restore" => return a.update(ctx, self.backup_picker(g, action, a.user.id).await?).await,
+                "view" | "restore" => return a.update(ctx, self.backup_picker(g, action, a.user.id)?).await,
                 _ => {}
             },
             "backupcreate" if action == "confirm" => return self.create_backup(ctx, &a).await,
@@ -811,9 +827,9 @@ impl AdminUi {
                 };
             }
             "role" => {
-                let role = cached_role(ctx, g, &id);
-                if !role.as_ref().is_some_and(|role| self.verification.assignable(g, role)) {
-                    return a.reply(ctx, CANNOT_USE_ROLE).await;
+                // Same hierarchy rules as role management: Gaia assigns this role on the admin's behalf.
+                if self.managed_role(ctx, &a, "add", &id).await?.is_none() {
+                    return Ok(());
                 }
                 if action == "verification" {
                     let old = self.repo.verification(&gs)?;
@@ -856,9 +872,10 @@ impl AdminUi {
                 }
                 let Some(channel) = channel else { return Ok(()) };
                 let token = deployment_token();
-                self.deployments.lock().unwrap().insert(
+                remember_deployment(
+                    &mut self.deployments.lock().unwrap(),
                     token.clone(),
-                    DeploymentSession { guild_id: g, user_id: a.user.id, channel_id: channel.id },
+                    DeploymentSession { guild_id: g, user_id: a.user.id, channel_id: channel.id, created: Instant::now() },
                 );
                 let panel = self.verification.panel(&config, true);
                 let mut components = panel.components;
@@ -1025,7 +1042,7 @@ impl AdminUi {
             .lock()
             .unwrap()
             .get(token)
-            .filter(|s| s.guild_id == a.guild_id && s.user_id == a.user.id)
+            .filter(|s| s.guild_id == a.guild_id && s.user_id == a.user.id && s.created.elapsed() < DEPLOYMENT_TTL)
             .map(|s| s.channel_id);
         let Some(channel_id) = session else {
             return a.reply(ctx, "That deployment confirmation expired. Start again from Verification.").await;
@@ -1405,8 +1422,8 @@ impl AdminUi {
         }
     }
 
-    async fn backup_picker(&self, guild_id: GuildId, action: &str, user_id: UserId) -> anyhow::Result<View> {
-        let backups = self.backups.available_to(&user_id.to_string()).await?;
+    fn backup_picker(&self, guild_id: GuildId, action: &str, user_id: UserId) -> anyhow::Result<View> {
+        let backups = self.backups.available_to(user_id, guild_id)?;
         let back = row(vec![nav("backups", guild_id, "← Back")]);
         if backups.is_empty() {
             return Ok(View::text("No backups you are authorized to access are available.", vec![back]));
@@ -1707,5 +1724,389 @@ mod tests {
         assert_eq!(ljubljana("2026-01-01T00:00:00.000Z"), "01/01/2026, 01:00:00");
         assert_eq!(ljubljana("2026-07-01T00:00:00.000Z"), "01/07/2026, 02:00:00");
         assert!(deployment_token().len() >= 8);
+    }
+}
+
+/// Behavioural tests over the fake Discord REST harness (`crate::test_support`).
+#[cfg(test)]
+mod harness_tests {
+    use super::*;
+    use crate::db::repositories::GuildBackup;
+    use crate::test_support::{GuildSeed, Harness, BOT_ID};
+    use serde_json::{json, Value};
+    use serenity::all::Permissions;
+
+    const G: u64 = 1;
+    const OWNER: u64 = 2;
+    const ADMIN: u64 = 5;
+    const HUMAN1: u64 = 6;
+    const HUMAN2: u64 = 7;
+    const BOT1: u64 = 8;
+    const BOT2: u64 = 9;
+    const GAIA_ROLE: u64 = 20;
+    const R1: u64 = 30;
+    const ADMIN_ROLE: u64 = 40;
+    /// Between the admin's highest role (10) and Gaia's (20).
+    const ABOVE_ACTOR: u64 = 50;
+    const MANAGED: u64 = 51;
+    /// Above Gaia's highest role.
+    const ABOVE_GAIA: u64 = 52;
+
+    fn ui_with(h: &Harness, repo: Arc<GaiaRepository>) -> AdminUi {
+        let mutes = Arc::new(MuteService::new(repo.clone(), h.discord.clone(), None));
+        let rooms = Arc::new(VoiceRoomService::new(repo.clone(), h.discord.clone()));
+        let verification = Arc::new(VerificationService::new(repo.clone(), h.discord.clone(), None));
+        let backups = Arc::new(BackupService::new(repo.clone(), h.discord.clone(), Some(h.audit.clone())));
+        AdminUi::new(repo, mutes, rooms, verification, backups, || "0s".to_string(), Some(h.audit.clone()))
+    }
+
+    fn ui(h: &Harness) -> AdminUi {
+        ui_with(h, h.repo.clone())
+    }
+
+    fn id_of(object: &Value) -> u64 {
+        object["id"].as_str().and_then(|id| id.parse().ok()).unwrap_or_default()
+    }
+
+    /// Mirrors the TS role-management fixture: r1 at position 5, the admin's highest role at `actor_position`,
+    /// bots 8 and 9, and r1 held by human2 and bot1. The member list endpoint returns everyone but Gaia.
+    async fn fixture(actor_position: u16, administrator: bool) -> (Harness, AdminUi) {
+        let h = Harness::start().await;
+        let admin = if administrator { Permissions::ADMINISTRATOR } else { Permissions::empty() };
+        let mut seed = GuildSeed::new(G, "Guild")
+            .role(GAIA_ROLE, "Gaia", 20, Permissions::MANAGE_ROLES)
+            .role(ADMIN_ROLE, "Admin", actor_position, admin)
+            .role(R1, "role-r1", 5, Permissions::empty())
+            .role(ABOVE_ACTOR, "Senior", 15, Permissions::empty())
+            .role(MANAGED, "Integration", 3, Permissions::empty())
+            .role(ABOVE_GAIA, "Top", 25, Permissions::empty())
+            .bot(&[GAIA_ROLE])
+            .member(OWNER, &[])
+            .member(ADMIN, &[ADMIN_ROLE])
+            .member(HUMAN1, &[])
+            .member(HUMAN2, &[R1])
+            .member(BOT1, &[R1])
+            .member(BOT2, &[]);
+        for role in seed.json["roles"].as_array_mut().unwrap() {
+            if id_of(role) == MANAGED {
+                role["managed"] = json!(true);
+            }
+        }
+        for member in seed.json["members"].as_array_mut().unwrap() {
+            if [BOT1, BOT2].contains(&id_of(&member["user"])) {
+                member["user"]["bot"] = json!(true);
+            }
+        }
+        let listed: Vec<Value> = seed.json["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| ![BOT_ID, OWNER].contains(&id_of(&m["user"])))
+            .cloned()
+            .collect();
+        h.seed(seed);
+        h.on("GET", "/guilds/1/members", 200, json!(listed));
+        let ui = ui(&h);
+        (h, ui)
+    }
+
+    fn ids(reply: &Value) -> Vec<String> {
+        reply["data"]["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|row| row["components"].as_array().unwrap())
+            .filter_map(|c| c["custom_id"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    fn content(reply: &Value) -> String {
+        reply["data"]["content"].as_str().unwrap_or_default().to_string()
+    }
+
+    fn edits(h: &Harness) -> Vec<Value> {
+        h.calls_to("PATCH", "/webhooks/*/*/messages/@original").into_iter().map(|c| c.body).collect()
+    }
+
+    fn role_puts(h: &Harness) -> Vec<String> {
+        let mut paths: Vec<String> = h.calls_to("PUT", "/guilds/1/members/*/roles/*").into_iter().map(|c| c.path).collect();
+        paths.sort();
+        paths
+    }
+
+    fn field(audit: &Value, name: &str) -> Option<String> {
+        audit["fields"].as_array()?.iter().find(|f| f["name"] == name).and_then(|f| f["value"].as_str()).map(str::to_string)
+    }
+
+    // ---- L5: role pickers use the role-management hierarchy checks
+
+    #[tokio::test]
+    async fn verification_and_autorole_pickers_refuse_roles_the_admin_or_gaia_cannot_manage() {
+        let (h, ui) = fixture(10, true).await;
+        let ctx = h.ctx();
+        let cases = [
+            ("verification", G, "That role no longer exists or cannot be assigned."),
+            ("verification", MANAGED, CANNOT_USE_ROLE),
+            ("verification", ABOVE_GAIA, CANNOT_USE_ROLE),
+            ("verification", ABOVE_ACTOR, "You can only manage roles below your own highest role."),
+            ("user", ABOVE_ACTOR, "You can only manage roles below your own highest role."),
+            ("bot", G, "That role no longer exists or cannot be assigned."),
+        ];
+        for (action, role, message) in cases {
+            h.clear_calls();
+            ui.handle_select(&ctx, &h.select(G, ADMIN, &format!("adminui:role:{action}:1"), 6, &[&role.to_string()])).await.unwrap();
+            let replies = h.replies();
+            assert_eq!(replies.len(), 1, "{action} {role}");
+            assert_eq!(content(&replies[0]), message, "{action} {role}");
+            assert_eq!(replies[0]["data"]["flags"], 64);
+        }
+        assert_eq!(h.repo.verification("1").unwrap().role_id, None);
+        let autoroles = h.repo.autoroles("1").unwrap();
+        assert_eq!((autoroles.user_role_id, autoroles.bot_role_id), (None, None));
+
+        ui.handle_select(&ctx, &h.select(G, ADMIN, "adminui:role:verification:1", 6, &[&R1.to_string()])).await.unwrap();
+        assert_eq!(h.repo.verification("1").unwrap().role_id, Some(R1.to_string()));
+        // The guild owner is not limited by their own role position, only by Gaia's.
+        ui.handle_select(&ctx, &h.select(G, OWNER, "adminui:role:user:1", 6, &[&ABOVE_ACTOR.to_string()])).await.unwrap();
+        assert_eq!(h.repo.autoroles("1").unwrap().user_role_id, Some(ABOVE_ACTOR.to_string()));
+    }
+
+    // ---- unbounded deployments map
+
+    #[test]
+    fn deployment_sessions_expire_and_are_capped() {
+        let session = |age: u64| DeploymentSession {
+            guild_id: GuildId::new(G),
+            user_id: UserId::new(ADMIN),
+            channel_id: ChannelId::new(9),
+            created: Instant::now().checked_sub(Duration::from_secs(age)).unwrap(),
+        };
+        let mut sessions = HashMap::new();
+        sessions.insert("old".to_string(), session(DEPLOYMENT_TTL.as_secs() + 1));
+        remember_deployment(&mut sessions, "new".into(), session(0));
+        assert!(!sessions.contains_key("old") && sessions.contains_key("new"));
+        for i in 0..MAX_DEPLOYMENTS + 10 {
+            remember_deployment(&mut sessions, i.to_string(), session(0));
+        }
+        assert_eq!(sessions.len(), MAX_DEPLOYMENTS);
+        assert!(sessions.contains_key(&(MAX_DEPLOYMENTS + 9).to_string()), "the newest session is kept");
+    }
+
+    #[tokio::test]
+    async fn refuses_an_expired_deployment_confirmation() {
+        let (h, ui) = fixture(10, true).await;
+        let created = Instant::now().checked_sub(DEPLOYMENT_TTL + Duration::from_secs(1)).unwrap();
+        let session = DeploymentSession { guild_id: GuildId::new(G), user_id: UserId::new(ADMIN), channel_id: ChannelId::new(9), created };
+        ui.deployments.lock().unwrap().insert("tok".into(), session);
+        ui.handle(&h.ctx(), &h.button(G, ADMIN, "adminui:verifydeploy:tok:1")).await.unwrap();
+        assert_eq!(content(&h.replies()[0]), "That deployment confirmation expired. Start again from Verification.");
+        assert!(h.calls_to("POST", "/channels/*/messages").is_empty());
+    }
+
+    // ---- L6: backup picker
+
+    fn store_backup(repo: &GaiaRepository, id: &str, guild: &str) {
+        let backup = GuildBackup {
+            backup_id: id.into(),
+            source_guild_id: guild.into(),
+            source_guild_name: format!("Guild {guild}"),
+            created_at: "2026-01-01T00:00:00.000Z".into(),
+            created_by: Some(ADMIN.to_string()),
+            creation_type: "manual".into(),
+            snapshot_json: "{}".into(),
+            ..Default::default()
+        };
+        repo.store_backup(&backup, None, None).unwrap();
+    }
+
+    #[tokio::test]
+    async fn backup_picker_lists_only_accessible_backups_from_the_cache() {
+        let (h, ui) = fixture(10, true).await;
+        h.seed(GuildSeed::new(2, "Elsewhere").role(60, "Admin", 1, Permissions::ADMINISTRATOR).member(ADMIN, &[60]));
+        h.seed(GuildSeed::new(3, "Member only").member(ADMIN, &[]));
+        for (id, guild) in [("here", "1"), ("admin-elsewhere", "2"), ("member-only", "3"), ("gaia-left", "4")] {
+            store_backup(&h.repo, id, guild);
+        }
+        h.clear_calls();
+        ui.handle(&h.ctx(), &h.button(G, ADMIN, "adminui:backup:restore:1")).await.unwrap();
+        let reply = &h.replies()[0];
+        let options: Vec<&str> = reply["data"]["components"][0]["components"][0]["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["value"].as_str().unwrap())
+            .collect();
+        // "gaia-left" stays reachable for its creator (README creator fallback); "member-only" does not.
+        assert_eq!(options.len(), 3, "{options:?}");
+        assert!(options.contains(&"here") && options.contains(&"admin-elsewhere") && options.contains(&"gaia-left"));
+        assert_eq!(h.trace().len(), 1, "answered from cache and SQLite only: {:?}", h.trace());
+    }
+
+    // ---- administrator component rechecks
+
+    #[tokio::test]
+    async fn rejects_admin_dashboard_and_backup_actions_after_administrator_permission_is_removed() {
+        let (h, ui) = fixture(10, false).await;
+        let ctx = h.ctx();
+        for custom_id in ["adminui:backup:create:1", "adminui:backupcreate:confirm:1", "adminui:nav:dashboard:1"] {
+            h.clear_calls();
+            ui.handle(&ctx, &h.button(G, ADMIN, custom_id)).await.unwrap();
+            assert!(content(&h.replies()[0]).contains("Administrator"), "{custom_id}");
+            assert_eq!(h.trace().len(), 1, "{custom_id}: {:?}", h.trace());
+        }
+        assert!(h.repo.backups("1").unwrap().is_empty());
+    }
+
+    // ---- admin role management
+
+    #[tokio::test]
+    async fn shows_a_single_remove_add_roles_entry_on_the_dashboard_that_opens_add_and_remove_choices() {
+        let (h, ui) = fixture(10, true).await;
+        let ctx = h.ctx();
+        ui.open(&ctx, &h.command(G, ADMIN, "admin", json!([]))).await.unwrap();
+        let dashboard = ids(&h.replies()[0]);
+        assert_eq!(dashboard.iter().filter(|id| *id == "adminui:nav:roles:1").count(), 1);
+        h.clear_calls();
+        ui.handle(&ctx, &h.button(G, ADMIN, "adminui:nav:roles:1")).await.unwrap();
+        assert_eq!(ids(&h.replies()[0]), ["adminui:rolemgmt:add:1", "adminui:rolemgmt:remove:1", "adminui:nav:dashboard:1"]);
+    }
+
+    #[tokio::test]
+    async fn walks_add_role_target_and_offers_user_everyone_and_bots() {
+        let (h, ui) = fixture(10, true).await;
+        let ctx = h.ctx();
+        ui.handle(&ctx, &h.button(G, ADMIN, "adminui:rolemgmt:add:1")).await.unwrap();
+        assert_eq!(ids(&h.replies()[0])[0], "adminui:rmrole:add:1");
+        h.clear_calls();
+        ui.handle_select(&ctx, &h.select(G, ADMIN, "adminui:rmrole:add:1", 6, &["30"])).await.unwrap();
+        assert_eq!(
+            ids(&h.replies()[0]),
+            ["adminui:rmtarget:add-30-user:1", "adminui:rmtarget:add-30-everyone:1", "adminui:rmtarget:add-30-bots:1", "adminui:nav:roles:1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn adds_a_role_to_everyone_who_lacks_it_after_confirmation() {
+        let (h, ui) = fixture(10, true).await;
+        let ctx = h.ctx();
+        ui.handle(&ctx, &h.button(G, ADMIN, "adminui:rmtarget:add-30-everyone:1")).await.unwrap();
+        assert!(content(&h.replies()[0]).contains("**3** members"));
+        assert!(role_puts(&h).is_empty());
+        ui.handle(&ctx, &h.button(G, ADMIN, "adminui:rmapply:add-30-everyone:1")).await.unwrap();
+        assert_eq!(role_puts(&h), ["/guilds/1/members/5/roles/30", "/guilds/1/members/6/roles/30", "/guilds/1/members/9/roles/30"]);
+        let edits = edits(&h);
+        assert_eq!(edits[0]["components"], json!([]));
+        assert!(edits.last().unwrap()["content"].as_str().unwrap().contains("Added <@&30> to 3 members"));
+        let audits = h.audits().await;
+        assert_eq!(audits[0]["title"], "Role Added");
+        assert_eq!(field(&audits[0], "Target").as_deref(), Some("Everyone"));
+        assert_eq!(field(&audits[0], "Changed").as_deref(), Some("3"));
+        assert_eq!(field(&audits[0], "Failed").as_deref(), Some("0"));
+    }
+
+    #[tokio::test]
+    async fn removes_a_role_only_from_bots_that_hold_it() {
+        let (h, ui) = fixture(10, true).await;
+        let ctx = h.ctx();
+        ui.handle(&ctx, &h.button(G, ADMIN, "adminui:rmtarget:remove-30-bots:1")).await.unwrap();
+        assert!(content(&h.replies()[0]).contains("**1** bot?"));
+        ui.handle(&ctx, &h.button(G, ADMIN, "adminui:rmapply:remove-30-bots:1")).await.unwrap();
+        let removed: Vec<String> = h.calls_to("DELETE", "/guilds/1/members/*/roles/*").into_iter().map(|c| c.path).collect();
+        assert_eq!(removed, ["/guilds/1/members/8/roles/30"]);
+    }
+
+    #[tokio::test]
+    async fn adds_or_removes_a_role_for_a_specific_user_and_skips_no_op_changes() {
+        let (h, ui) = fixture(10, true).await;
+        let ctx = h.ctx();
+        ui.handle(&ctx, &h.button(G, ADMIN, "adminui:rmtarget:add-30-user:1")).await.unwrap();
+        assert_eq!(ids(&h.replies()[0])[0], "adminui:rmuser:add-30:1");
+        h.clear_calls();
+        ui.handle_select(&ctx, &h.select(G, ADMIN, "adminui:rmuser:add-30:1", 5, &["6"])).await.unwrap();
+        assert!(content(&h.replies()[0]).contains("Added <@&30> to 1 member."));
+        h.clear_calls();
+        // human2 already holds r1 (the cache only changes through gateway events, which the harness has none of).
+        ui.handle_select(&ctx, &h.select(G, ADMIN, "adminui:rmuser:add-30:1", 5, &["7"])).await.unwrap();
+        assert!(content(&h.replies()[0]).contains("already has"));
+        h.clear_calls();
+        ui.handle_select(&ctx, &h.select(G, ADMIN, "adminui:rmuser:remove-30:1", 5, &["7"])).await.unwrap();
+        assert_eq!(h.trace().iter().filter(|c| c.contains("/roles/")).collect::<Vec<_>>(), ["DELETE /guilds/1/members/7/roles/30"]);
+        h.clear_calls();
+        ui.handle_select(&ctx, &h.select(G, ADMIN, "adminui:rmuser:add-30:1", 5, &["999"])).await.unwrap();
+        assert!(content(&h.replies()[0]).contains("not a member"));
+        assert!(role_puts(&h).is_empty());
+    }
+
+    #[tokio::test]
+    async fn reports_per_member_failures_without_stopping_the_run() {
+        let (h, ui) = fixture(10, true).await;
+        h.on("PUT", "/guilds/1/members/6/roles/30", 403, json!({"code": 50013, "message": "Missing Permissions"}));
+        ui.handle(&h.ctx(), &h.button(G, ADMIN, "adminui:rmapply:add-30-everyone:1")).await.unwrap();
+        assert_eq!(role_puts(&h).len(), 3, "the failure for member 6 did not stop the run");
+        assert!(edits(&h).last().unwrap()["content"].as_str().unwrap().contains("Failed for 1: <@6>"));
+        let audits = h.audits().await;
+        assert_eq!(audits[0]["color"], 0xed4245);
+        assert_eq!(field(&audits[0], "Changed").as_deref(), Some("2"));
+        assert_eq!(field(&audits[0], "Failed").as_deref(), Some("1"));
+    }
+
+    #[tokio::test]
+    async fn rejects_role_management_once_administrator_permission_is_gone() {
+        let (h, ui) = fixture(10, false).await;
+        ui.handle(&h.ctx(), &h.button(G, ADMIN, "adminui:rmapply:add-30-everyone:1")).await.unwrap();
+        assert!(content(&h.replies()[0]).contains("Administrator"));
+        assert!(role_puts(&h).is_empty());
+    }
+
+    // ---- destructive restore progress lifecycle
+
+    /// Guild 1 with the admin as cached owner; its REST view (Gaia as owner) is served for backups.
+    fn backup_guild(h: &Harness, member_count: u64) {
+        let mut seed = GuildSeed::new(G, "Guild").owner(ADMIN).bot(&[]).member(ADMIN, &[]);
+        seed.json["member_count"] = json!(member_count);
+        let mut raw = seed.json.clone();
+        raw["owner_id"] = json!(BOT_ID.to_string());
+        let mut listed = seed.json["members"].as_array().unwrap().clone();
+        listed.push(json!({"user": crate::test_support::user_json(HUMAN1), "roles": [], "joined_at": "2026-01-01T00:00:00.000Z", "deaf": false, "mute": false, "flags": 0}));
+        h.seed(seed);
+        h.on("GET", "/guilds/1", 200, raw.clone());
+        h.on("PATCH", "/guilds/1", 200, raw);
+        h.on("GET", "/guilds/1/channels", 200, json!([]));
+        h.on("GET", "/guilds/1/members", 200, json!(listed));
+    }
+
+    #[tokio::test]
+    async fn acknowledges_manual_backup_creation_before_member_acquisition_starts() {
+        let h = Harness::start().await;
+        backup_guild(&h, 3);
+        let ui = ui(&h);
+        ui.handle(&h.ctx(), &h.button(G, ADMIN, "adminui:backupcreate:confirm:1")).await.unwrap();
+        let trace = h.trace();
+        let ack = trace.iter().position(|c| c.starts_with("POST /interactions/")).unwrap();
+        let members = trace.iter().position(|c| c == "GET /guilds/1/members").expect("member synchronization ran");
+        assert!(ack < members, "{trace:?}");
+        assert_eq!(h.replies()[0]["type"], 6);
+        assert!(edits(&h).last().unwrap()["content"].as_str().unwrap().starts_with("🟢 Backup Created"));
+        assert_eq!(h.repo.backups("1").unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn continues_and_persists_restore_work_when_its_progress_message_is_deleted() {
+        let h = Harness::start().await;
+        backup_guild(&h, 0);
+        let ui = ui(&h);
+        let backup = ui.backups.create(GuildId::new(G), Some(&ADMIN.to_string()), "manual", None).await.unwrap();
+        h.on("PATCH", "/webhooks/*/*/messages/@original", 404, json!({"code": 10008, "message": "Unknown Message"}));
+        h.clear_calls();
+        let custom_id = format!("adminui:backuprestore:confirm-{}:1", backup.backup_id);
+        ui.handle(&h.ctx(), &h.button(G, ADMIN, &custom_id)).await.unwrap();
+        assert_eq!(edits(&h).len(), 1, "the first failed edit stops further progress edits");
+        let trace = h.trace();
+        let failed_edit = trace.iter().position(|c| c.starts_with("PATCH /webhooks/")).unwrap();
+        assert!(trace[failed_edit..].iter().any(|c| c == "PATCH /guilds/1"), "restore work continued: {trace:?}");
+        let titles: Vec<Value> = h.audits().await.iter().map(|a| a["title"].clone()).collect();
+        assert!(titles.contains(&json!("Restore Completed")) || titles.contains(&json!("Restore Completed With Warnings")), "{titles:?}");
+        let completion = h.calls_to("PATCH", "/channels/*/messages/*").into_iter().last().expect("progress DM finalized");
+        assert!(completion.body["embeds"][0]["title"].as_str().unwrap().contains("Completed"), "{}", completion.body);
     }
 }

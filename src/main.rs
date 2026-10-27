@@ -4,6 +4,8 @@ mod db;
 mod discord;
 mod logger;
 mod services;
+#[cfg(test)]
+mod test_support;
 
 use bot::{GaiaBot, Handler};
 use db::repositories::GaiaRepository;

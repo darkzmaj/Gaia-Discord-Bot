@@ -30,7 +30,8 @@ Backups made before this version did not record Community state or Rules/Updates
 - [ ] Force a channel creation or overwrite failure. Verify the database operation is `failed_partial`, the result is red, and its sanitized Discord code/message and safety backup ID are retained.
 - [ ] Corrupt one restored overwrite before final validation in a disposable test. Verify final validation produces `failed_partial`.
 - [ ] Start two restores into B and attempt an automatic/manual backup during one. Verify the second restore is rejected and the backup is deferred/rejected.
-
+- [ ] With an account that is Administrator in B but not in A, open View/Restore Backup in B. Only B's backups (and those of other guilds where it is currently Administrator) are listed, and the picker answers immediately.
+- [ ] Restore a backup containing a role icon and guild icon/banner. Both are fetched only from `cdn.discordapp.com`/`media.discordapp.net`; an icon Discord no longer serves becomes a warning, not a failed restore.
 ## Final record
 
 - [ ] Record all Discord/API limitations. Icon, banner and splash are captured for comparison but are not uploaded automatically; Discord-controlled/eligibility features outside Community are informational only.

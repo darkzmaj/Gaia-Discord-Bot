@@ -126,7 +126,7 @@ impl EmbedScheduler {
     }
 
     async fn send(&self, schedule: &ScheduledEmbedSend) -> anyhow::Result<()> {
-        let template = self.repo.embed_by_id(&schedule.template_id)?.ok_or_else(|| anyhow!("The referenced global embed template no longer exists."))?;
+        let template = self.repo.embed_by_id(&schedule.guild_id, &schedule.template_id)?.ok_or_else(|| anyhow!("The referenced embed template no longer exists."))?;
         let bot_id = self.discord.cache.current_user().id;
         // Resolve everything from the cache before any await (cache guards are not Send).
         let (guild_id, guild_name, channel_id, channel_name, resolved) = {
@@ -147,7 +147,7 @@ impl EmbedScheduler {
             let resolved = resolve_mention(&guild, bot_id, &parse_mention(schedule.mention_json.as_deref()));
             (guild.id, guild.name.clone(), channel.id, channel.name.clone(), resolved)
         };
-        let rendered = render_template(&self.repo, &template.template_id, &template.payload_json).await?;
+        let rendered = render_template(&self.repo, &schedule.guild_id, &template.template_id, &template.payload_json).await?;
         let message = channel_id.send_message(&self.discord.http, with_delivery_mention(rendered, &resolved.mention).create_message()).await?;
         let (guild, channel, message_id) = (guild_id.to_string(), channel_id.to_string(), message.id.to_string());
         self.repo.track_sent_embed(&template.template_id, &guild, &channel, &message_id)?;

@@ -6,7 +6,7 @@ require 'time'
 module Gaia
   # JSON log lines on stdout, matching src/logger.rs (secrets redacted).
   module Logger
-    WEBHOOK = %r{(?:https?://[^\s/]+)?/api/webhooks/\d{17,20}/[A-Za-z0-9_\-.]+}i
+    WEBHOOK = %r{(?:https?://[^\s/]+)?/api/(?:v\d+/)?webhooks/\d{17,20}/[A-Za-z0-9_\-.]+}i
     TOKEN = /[A-Za-z\d_-]{20,}\.[A-Za-z\d_-]{6,}\.[A-Za-z\d_-]{20,}/
 
     module_function

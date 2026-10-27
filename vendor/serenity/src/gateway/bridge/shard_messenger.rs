@@ -40,6 +40,20 @@ impl ShardMessenger {
         }
     }
 
+    /// Gaia patch: a messenger attached to no shard (its messages are dropped), so tests can build
+    /// a [`Context`] without a gateway connection.
+    ///
+    /// [`Context`]: crate::client::Context
+    #[doc(hidden)]
+    #[must_use]
+    pub fn detached() -> Self {
+        Self {
+            tx: futures::channel::mpsc::unbounded().0,
+            #[cfg(feature = "collector")]
+            collectors: Arc::default(),
+        }
+    }
+
     /// Requests that one or multiple [`Guild`]s be chunked.
     ///
     /// This will ask the gateway to start sending member chunks for large guilds (250 members+).

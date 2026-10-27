@@ -1,4 +1,4 @@
-//! Gaia bot: gateway event wiring, interaction dispatch, moderation commands and the global Embed Manager UI.
+//! Gaia bot: gateway event wiring, interaction dispatch, moderation commands and the per-server Embed Manager UI.
 use crate::config::Config;
 use crate::ctx;
 use crate::db::repositories::{GaiaRepository, ScheduledEmbedSend};
@@ -11,8 +11,9 @@ use crate::services::backup_service::BackupService;
 use crate::services::command_sync::CommandSynchronizer;
 use crate::services::duration::{discord_timestamp_seconds, human_duration, parse_duration};
 use crate::services::embed_renderer::{with_default_color, 
-    attachment_record, mention_label, parse_mention, render_template, resolve_mention, resolve_mention_with,
-    with_delivery_mention, DeliveryMention, RenderedMessage, MAX_ATTACHMENT_BYTES,
+    attachment_record, download_attachment, is_discord_cdn, mention_label, parse_mention, render_template, resolve_mention,
+    resolve_mention_with, with_delivery_mention, DeliveryMention, RenderedMessage, MAX_ATTACHMENT_BYTES, MAX_TEMPLATE_ATTACHMENTS,
+    MAX_TEMPLATE_ATTACHMENT_BYTES,
 };
 use crate::services::embed_scheduler::EmbedScheduler;
 use crate::services::embed_validation::validate_embed_payload;
@@ -67,6 +68,67 @@ struct Session {
     utc: Option<String>,
     display: Option<String>,
     mention: Option<DeliveryMention>,
+}
+
+/// Embed Manager sessions expire after this long (swept whenever a new one is created).
+const SESSION_TTL: Duration = Duration::from_secs(15 * 60);
+/// Live sessions per user per store; creating another evicts that user's oldest.
+const SESSIONS_PER_USER: usize = 5;
+
+/// Short-lived interaction state keyed by token, bounded by [`SESSION_TTL`] and [`SESSIONS_PER_USER`].
+struct SessionStore<T> {
+    entries: Mutex<HashMap<String, (Instant, String, T)>>,
+}
+
+impl<T> Default for SessionStore<T> {
+    fn default() -> Self {
+        Self { entries: Mutex::default() }
+    }
+}
+
+impl<T: Clone> SessionStore<T> {
+    fn insert(&self, token: String, user_id: &str, value: T) {
+        let now = Instant::now();
+        let mut entries = self.entries.lock().unwrap();
+        entries.retain(|_, (at, _, _)| now.duration_since(*at) < SESSION_TTL);
+        let mut mine: Vec<(Instant, String)> =
+            entries.iter().filter(|(_, (_, user, _))| user == user_id).map(|(token, (at, _, _))| (*at, token.clone())).collect();
+        mine.sort();
+        let excess = (mine.len() + 1).saturating_sub(SESSIONS_PER_USER);
+        for (_, token) in mine.into_iter().take(excess) {
+            entries.remove(&token);
+        }
+        entries.insert(token, (now, user_id.to_string(), value));
+    }
+    fn get(&self, token: &str) -> Option<T> {
+        self.entries.lock().unwrap().get(token).filter(|(at, _, _)| at.elapsed() < SESSION_TTL).map(|(_, _, value)| value.clone())
+    }
+    /// Applies `f` to a live entry; `None` when it is missing or expired.
+    fn update<R>(&self, token: &str, f: impl FnOnce(&mut T) -> R) -> Option<R> {
+        self.entries.lock().unwrap().get_mut(token).filter(|(at, _, _)| at.elapsed() < SESSION_TTL).map(|(_, _, value)| f(value))
+    }
+    fn remove(&self, token: &str) {
+        self.entries.lock().unwrap().remove(token);
+    }
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.lock().unwrap().len()
+    }
+    #[cfg(test)]
+    fn backdate(&self, token: &str, by: Duration) {
+        if let Some((at, _, _)) = self.entries.lock().unwrap().get_mut(token) {
+            *at -= by;
+        }
+    }
+}
+
+const INVALID_NAME: &str = "Embed names must be 1–64 characters without control characters.";
+
+/// Template names (from modals and custom IDs): trimmed, 1–64 characters, no control characters.
+fn template_name(raw: &str) -> Option<String> {
+    let name = raw.trim();
+    (!name.is_empty() && crate::services::embed_validation::js_len(name) <= 64 && !name.chars().any(char::is_control))
+        .then(|| name.to_string())
 }
 
 /// One uploaded file from the modal FileUpload component.
@@ -201,7 +263,7 @@ fn ephemeral() -> CreateInteractionResponseMessage {
 /// The Embed Manager panel shown by `/embed` (rows of 5 and 1 buttons).
 pub fn embed_manager_panel(guild_id: &str) -> (CreateEmbed, Vec<CreateActionRow>) {
     let embed = CreateEmbed::new().color(COLOR).title("Gaia Embed Manager").description(
-        "Global embeds are shared across every server using this Gaia instance.\n\nScheduled sends use the latest saved template at delivery time. Use **Attachments** to add, replace, or remove a saved file.",
+        "Embed templates belong to this server; other servers using Gaia cannot see or use them.\n\nScheduled sends use the latest saved template at delivery time. Use **Attachments** to add, replace, or remove a saved file.",
     );
     let rows = vec![
         CreateActionRow::Buttons(vec![
@@ -414,9 +476,9 @@ pub struct GaiaBot {
     ready_once: AtomicBool,
     /// Notified when the ready sequence fails; `main` then exits with code 1.
     pub startup_failed: tokio::sync::Notify,
-    pending_embeds: Mutex<HashMap<String, PendingEmbed>>,
-    embed_sessions: Mutex<HashMap<String, Session>>,
-    schedule_sessions: Mutex<HashMap<String, Session>>,
+    pending_embeds: SessionStore<PendingEmbed>,
+    embed_sessions: SessionStore<Session>,
+    schedule_sessions: SessionStore<Session>,
 }
 
 fn audit_event(title: &str, category: &str, color: &str) -> AuditEvent {
@@ -467,9 +529,9 @@ impl GaiaBot {
             started_at,
             ready_once: AtomicBool::new(false),
             startup_failed: tokio::sync::Notify::new(),
-            pending_embeds: Mutex::default(),
-            embed_sessions: Mutex::default(),
-            schedule_sessions: Mutex::default(),
+            pending_embeds: SessionStore::default(),
+            embed_sessions: SessionStore::default(),
+            schedule_sessions: SessionStore::default(),
         }
     }
 
@@ -928,7 +990,7 @@ impl GaiaBot {
         self.send(Ix::Command(i), ephemeral().embed(embed).components(rows)).await
     }
 
-    fn sessions(&self, mode: &str) -> &Mutex<HashMap<String, Session>> {
+    fn sessions(&self, mode: &str) -> &SessionStore<Session> {
         if mode == "manual" {
             &self.embed_sessions
         } else {
@@ -944,29 +1006,25 @@ impl GaiaBot {
 
     /// A session owned by this user in this guild (TS `mentionSession` checks).
     fn owned_session(&self, mode: &str, token: &str, user: UserId, guild_id: GuildId) -> Option<Session> {
-        self.sessions(mode)
-            .lock()
-            .unwrap()
-            .get(token)
-            .filter(|s| s.user_id == user.to_string() && s.guild_id == guild_id.to_string())
-            .cloned()
+        self.sessions(mode).get(token).filter(|s| s.user_id == user.to_string() && s.guild_id == guild_id.to_string())
     }
 
     fn set_mention(&self, mode: &str, token: &str, mention: DeliveryMention) {
-        if let Some(session) = self.sessions(mode).lock().unwrap().get_mut(token) {
-            session.mention = Some(mention);
+        self.sessions(mode).update(token, |session| session.mention = Some(mention));
+    }
+
+    /// Every embed handler (buttons, selects, modals) re-checks current Administrator permission.
+    async fn is_embed_admin(&self, guild_id: GuildId, user: UserId) -> bool {
+        match self.fetch_member(guild_id, user).await {
+            Some(member) => self.has_level(&member, PermissionLevel::Administrator).await,
+            None => false,
         }
     }
 
     async fn handle_embed_ui(&self, i: Ix<'_>) -> anyhow::Result<()> {
         let Some(guild_id) = i.guild_id() else { return Ok(()) };
         let user = i.user();
-        let member = self.fetch_member(guild_id, user.id).await;
-        let permitted = match &member {
-            Some(member) => self.has_level(member, PermissionLevel::Administrator).await,
-            None => false,
-        };
-        if !permitted {
+        if !self.is_embed_admin(guild_id, user.id).await {
             self.reply(i, "You need Discord Administrator permission to manage embeds.").await;
             return Ok(());
         }
@@ -1059,8 +1117,7 @@ impl GaiaBot {
         }
         if i.is_button() && action == "mentionback" {
             let (mode, token) = (piece(2), piece(3));
-            let session = self.sessions(mode).lock().unwrap().get(token).cloned();
-            let Some(session) = session else {
+            let Some(session) = self.owned_session(mode, token, user.id, guild_id) else {
                 self.reply(i, expired).await;
                 return Ok(());
             };
@@ -1069,12 +1126,16 @@ impl GaiaBot {
         }
         if i.is_button() && action == "mentioncancel" {
             let (mode, token) = (piece(2), piece(3));
-            self.sessions(mode).lock().unwrap().remove(token);
+            if self.owned_session(mode, token, user.id, guild_id).is_none() {
+                self.reply(i, expired).await;
+                return Ok(());
+            }
+            self.sessions(mode).remove(token);
             let embed = CreateEmbed::new().color(0xfee75c).title("Cancelled").description("No embed was sent or scheduled.");
             return self.update(i, CreateInteractionResponseMessage::new().embed(embed).components(vec![])).await;
         }
         if i.is_string_select() && action == "attachmentremove" {
-            let Some(template) = self.repo.embed_by_id(token_or_guild)? else {
+            let Some(template) = self.repo.embed_by_id(&gid, token_or_guild)? else {
                 self.reply(i, "That template no longer exists.").await;
                 return Ok(());
             };
@@ -1087,7 +1148,7 @@ impl GaiaBot {
                 .await;
                 return Ok(());
             }
-            self.repo.delete_attachment(&template.template_id, &filename)?;
+            self.repo.delete_attachment(&gid, &template.template_id, &filename)?;
             return self
                 .update(
                     i,
@@ -1098,7 +1159,7 @@ impl GaiaBot {
                 .await;
         }
         if i.is_button() && action == "cancelschedule" {
-            let schedule = self.repo.schedule(token_or_guild)?.filter(|s| s.guild_id == gid && s.status == "scheduled");
+            let schedule = self.repo.schedule(&gid, token_or_guild)?.filter(|s| s.status == "scheduled");
             let Some(schedule) = schedule else {
                 self.reply(i, "That pending schedule is unavailable.").await;
                 return Ok(());
@@ -1116,7 +1177,7 @@ impl GaiaBot {
             return self.update(i, CreateInteractionResponseMessage::new().content(content).components(vec![row])).await;
         }
         if i.is_button() && action == "cancelconfirm" {
-            let schedule = self.repo.schedule(token_or_guild)?;
+            let schedule = self.repo.schedule(&gid, token_or_guild)?;
             let cancelled = self.repo.cancel_schedule(token_or_guild, &gid, &uid)?;
             if let (true, Some(schedule)) = (cancelled, &schedule) {
                 self.audit.record(AuditEvent {
@@ -1171,58 +1232,52 @@ impl GaiaBot {
             return self.send(i, ephemeral().embed(embed).components(components)).await;
         }
         if i.is_button() && action == "schedulecreate" {
-            let names = self.repo.embeds(Some(0), Some(25))?;
+            let names = self.repo.embeds(&gid, Some(0), Some(25))?;
             if names.is_empty() {
-                return self.send(i, ephemeral().content("Save a global embed before scheduling it.")).await;
+                return self.send(i, ephemeral().content("Save an embed before scheduling it.")).await;
             }
             let token = session_token(5);
-            self.embed_sessions
-                .lock()
-                .unwrap()
-                .insert(token.clone(), Session { guild_id: gid.clone(), user_id: uid.clone(), ..Default::default() });
-            let row = string_select(format!("embedui:select:schedule:{token}"), "Select a global embed", name_options(&names));
+            self.embed_sessions.insert(token.clone(), &uid, Session { guild_id: gid.clone(), user_id: uid.clone(), ..Default::default() });
+            let row = string_select(format!("embedui:select:schedule:{token}"), "Select an embed", name_options(&names));
             return self.send(i, ephemeral().content("Choose a template to schedule.").components(vec![row])).await;
         }
         if i.is_button() && matches!(action, "edit" | "send" | "json") {
-            let names = self.repo.embeds(Some(0), Some(25))?;
+            let names = self.repo.embeds(&gid, Some(0), Some(25))?;
             if names.is_empty() {
-                return self.send(i, ephemeral().content("No global embeds have been saved.")).await;
+                return self.send(i, ephemeral().content("No embeds have been saved in this server.")).await;
             }
             let token = session_token(5);
-            self.embed_sessions
-                .lock()
-                .unwrap()
-                .insert(token.clone(), Session { guild_id: gid.clone(), user_id: uid.clone(), ..Default::default() });
-            let row = string_select(format!("embedui:select:{action}:{token}"), "Select a global embed", name_options(&names));
+            self.embed_sessions.insert(token.clone(), &uid, Session { guild_id: gid.clone(), user_id: uid.clone(), ..Default::default() });
+            let row = string_select(format!("embedui:select:{action}:{token}"), "Select an embed", name_options(&names));
             return self.send(i, ephemeral().content(format!("Select an embed to {action}.")).components(vec![row])).await;
         }
         if i.is_button() && action == "list" {
-            let names = self.repo.embeds(Some(0), Some(25))?;
+            let names = self.repo.embeds(&gid, Some(0), Some(25))?;
             let content = if names.is_empty() {
-                "No global embeds have been saved.".to_string()
+                "No embeds have been saved in this server.".to_string()
             } else {
-                format!("**Global Embeds**\n{}", names.iter().map(|n| format!("• {n}")).collect::<Vec<_>>().join("\n"))
+                format!("**Embeds**\n{}", names.iter().map(|n| format!("• {n}")).collect::<Vec<_>>().join("\n"))
             };
             return self.send(i, ephemeral().content(content)).await;
         }
         if i.is_button() && action == "attachments" {
-            let names = self.repo.embeds(Some(0), Some(25))?;
+            let names = self.repo.embeds(&gid, Some(0), Some(25))?;
             if names.is_empty() {
                 self.reply(i, "Create an embed before adding attachments.").await;
                 return Ok(());
             }
-            let row = string_select(format!("embedui:attachmenttemplate:{gid}"), "Select a global embed", name_options(&names));
+            let row = string_select(format!("embedui:attachmenttemplate:{gid}"), "Select an embed", name_options(&names));
             return self
                 .send(i, ephemeral().content("Select the saved embed whose attachments you want to manage.").components(vec![row]))
                 .await;
         }
         if i.is_string_select() && action == "attachmenttemplate" {
             let name = i.values().into_iter().next().unwrap_or_default();
-            let Some(template) = self.repo.embed(&name)? else {
-                self.reply(i, "That global embed no longer exists.").await;
+            let Some(template) = self.repo.embed(&gid, &name)? else {
+                self.reply(i, "That embed no longer exists.").await;
                 return Ok(());
             };
-            let attachments = self.repo.attachments(&template.template_id)?;
+            let attachments = self.repo.attachments(&gid, &template.template_id)?;
             let content = if attachments.is_empty() {
                 format!("**{}** has no stored attachments.", template.name)
             } else {
@@ -1266,8 +1321,8 @@ impl GaiaBot {
             return Ok(());
         }
         if let (true, "attachmentupload", Ix::Modal(modal)) = (i.is_modal(), action, i) {
-            let Some(template) = self.repo.embed_by_id(token_or_guild)? else {
-                self.reply(i, "That global embed no longer exists.").await;
+            let Some(template) = self.repo.embed_by_id(&gid, token_or_guild)? else {
+                self.reply(i, "That embed no longer exists.").await;
                 return Ok(());
             };
             // serenity drops the Label/FileUpload payload while deserializing; recover it from the
@@ -1277,25 +1332,29 @@ impl GaiaBot {
                 self.reply(i, "No attachment was received.").await;
                 return Ok(());
             };
-            return self.store_upload(i, &template.template_id, &template.name, upload).await;
+            return self.store_upload(i, &gid, &template.template_id, &template.name, upload).await;
         }
         if i.is_button() && action == "create" {
-            let input = CreateInputText::new(InputTextStyle::Short, "Global embed name", "name").required(true).max_length(64);
-            i.respond(&self.discord, text_modal(format!("embedui:name:create:{gid}"), "Create Global Embed", vec![input])).await?;
+            let input = CreateInputText::new(InputTextStyle::Short, "Embed name", "name").required(true).max_length(64);
+            i.respond(&self.discord, text_modal(format!("embedui:name:create:{gid}"), "Create Embed", vec![input])).await?;
             return Ok(());
         }
         if i.is_modal() && action == "name" {
-            let name = i.text("name").trim().to_string();
-            if name.is_empty() {
+            let raw = i.text("name");
+            if raw.trim().is_empty() {
                 self.reply(i, "Provide an embed name.").await;
                 return Ok(());
             }
-            if self.repo.embed(&name)?.is_some() {
-                self.reply(i, "That global embed already exists.").await;
+            let Some(name) = template_name(&raw) else {
+                self.reply(i, INVALID_NAME).await;
+                return Ok(());
+            };
+            if self.repo.embed(&gid, &name)?.is_some() {
+                self.reply(i, "That embed already exists in this server.").await;
                 return Ok(());
             }
-            let embed = CreateEmbed::new().color(COLOR).title("Create Global Embed").description(format!(
-                "**{name}** will be shared across every server using this Gaia instance.\n\nEnter Discord-compatible message JSON next. Use the large-payload option only when the JSON exceeds one modal field."
+            let embed = CreateEmbed::new().color(COLOR).title("Create Embed").description(format!(
+                "**{name}** will be saved for this server only.\n\nEnter Discord-compatible message JSON next. Use the large-payload option only when the JSON exceeds one modal field."
             ));
             let encoded = encode_uri_component(&name);
             let row = CreateActionRow::Buttons(vec![
@@ -1307,20 +1366,21 @@ impl GaiaBot {
         if i.is_string_select() && action == "select" {
             let (mode, token) = (token_or_guild, piece(3));
             let name = i.values().into_iter().next().unwrap_or_default();
-            let session = self.embed_sessions.lock().unwrap().get(token).cloned();
+            let session = self.embed_sessions.get(token);
             if !session.is_some_and(|s| s.user_id == uid && s.guild_id == gid) {
                 self.reply(i, "That selection expired.").await;
                 return Ok(());
             }
-            self.embed_sessions.lock().unwrap().remove(token);
-            let Some(stored) = self.repo.embed(&name)? else {
+            self.embed_sessions.remove(token);
+            let Some(stored) = self.repo.embed(&gid, &name)? else {
                 self.reply(i, "That embed no longer exists.").await;
                 return Ok(());
             };
             if mode == "schedule" {
                 let schedule_token = session_token(5);
-                self.schedule_sessions.lock().unwrap().insert(
+                self.schedule_sessions.insert(
                     schedule_token.clone(),
+                    &uid,
                     Session {
                         guild_id: gid.clone(),
                         user_id: uid.clone(),
@@ -1345,7 +1405,7 @@ impl GaiaBot {
                     ButtonStyle::Primary,
                 )]);
                 return self
-                    .update(i, CreateInteractionResponseMessage::new().content(format!("Editing global embed **{name}**.")).components(vec![row]))
+                    .update(i, CreateInteractionResponseMessage::new().content(format!("Editing embed **{name}**.")).components(vec![row]))
                     .await;
             }
             if mode == "json" {
@@ -1363,8 +1423,9 @@ impl GaiaBot {
                 return self.update(i, CreateInteractionResponseMessage::new().content(content).components(vec![])).await;
             }
             let send_token = session_token(5);
-            self.embed_sessions.lock().unwrap().insert(
+            self.embed_sessions.insert(
                 send_token.clone(),
+                &uid,
                 Session { guild_id: gid.clone(), user_id: uid.clone(), name: Some(name.clone()), ..Default::default() },
             );
             return self
@@ -1379,16 +1440,17 @@ impl GaiaBot {
         if i.is_channel_select() && action == "channel" && token_or_guild == "schedule" {
             let token = piece(3);
             let channel = i.values().first().and_then(|id| self.text_channel(guild_id, id));
-            let claimed = {
-                let mut sessions = self.schedule_sessions.lock().unwrap();
-                match (sessions.get_mut(token).filter(|s| s.user_id == uid), channel) {
-                    (Some(session), Some(channel)) => {
-                        session.channel_id = Some(channel.id.to_string());
-                        true
-                    }
-                    _ => false,
-                }
-            };
+            let claimed = channel.is_some_and(|channel| {
+                self.schedule_sessions
+                    .update(token, |s| {
+                        let owned = s.user_id == uid && s.guild_id == gid;
+                        if owned {
+                            s.channel_id = Some(channel.id.to_string());
+                        }
+                        owned
+                    })
+                    .unwrap_or(false)
+            });
             if !claimed {
                 self.reply(i, "That schedule session expired or the channel is unavailable.").await;
                 return Ok(());
@@ -1401,18 +1463,18 @@ impl GaiaBot {
             return Ok(());
         }
         if i.is_modal() && action == "time" {
-            let session = self.schedule_sessions.lock().unwrap().get(token_or_guild).cloned();
+            let session = self.schedule_sessions.get(token_or_guild);
             if !session.is_some_and(|s| s.user_id == uid && s.guild_id == gid && s.channel_id.is_some()) {
                 self.reply(i, "That schedule session expired.").await;
                 return Ok(());
             }
             match parse_ljubljana_schedule(&i.text("time"), chrono::Utc::now()) {
                 Ok(parsed) => {
-                    if let Some(session) = self.schedule_sessions.lock().unwrap().get_mut(token_or_guild) {
+                    self.schedule_sessions.update(token_or_guild, |session| {
                         session.utc = Some(parsed.utc.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
                         session.display = Some(parsed.display);
                         session.mention = Some(DeliveryMention::default());
-                    }
+                    });
                     let message = self.mention_message("schedule", token_or_guild, &DeliveryMention::default(), guild_id);
                     return self.send(i, message.ephemeral(true)).await;
                 }
@@ -1423,11 +1485,15 @@ impl GaiaBot {
             }
         }
         if i.is_button() && action == "schedulecancel" {
-            self.schedule_sessions.lock().unwrap().remove(token_or_guild);
+            if self.owned_session("schedule", token_or_guild, user.id, guild_id).is_none() {
+                self.reply(i, "That schedule session expired.").await;
+                return Ok(());
+            }
+            self.schedule_sessions.remove(token_or_guild);
             return self.update(i, CreateInteractionResponseMessage::new().content("Schedule cancelled.").components(vec![])).await;
         }
         if i.is_button() && action == "scheduleconfirm" {
-            let session = self.schedule_sessions.lock().unwrap().get(token_or_guild).cloned();
+            let session = self.schedule_sessions.get(token_or_guild);
             let Some(session) =
                 session.filter(|s| s.user_id == uid && s.guild_id == gid && s.channel_id.is_some() && s.utc.is_some())
             else {
@@ -1474,7 +1540,7 @@ impl GaiaBot {
                 details: details(&[("Template", name.clone()), ("Delivery", delivery.clone())]),
                 ..audit_event("Embed Scheduled", "Embeds", "info")
             });
-            self.schedule_sessions.lock().unwrap().remove(token_or_guild);
+            self.schedule_sessions.remove(token_or_guild);
             let embed = CreateEmbed::new().color(0x57f287).title("Embed Scheduled").fields(vec![
                 field("Embed", name, true),
                 field("Destination", format!("<#{channel_id}>"), true),
@@ -1484,7 +1550,7 @@ impl GaiaBot {
             return self.update(i, CreateInteractionResponseMessage::new().embed(embed).components(vec![])).await;
         }
         if i.is_button() && action == "manualconfirm" {
-            let session = self.embed_sessions.lock().unwrap().get(token_or_guild).cloned();
+            let session = self.embed_sessions.get(token_or_guild);
             let Some(session) =
                 session.filter(|s| s.user_id == uid && s.guild_id == gid && s.name.is_some() && s.channel_id.is_some())
             else {
@@ -1492,7 +1558,7 @@ impl GaiaBot {
                 return Ok(());
             };
             let channel = self.text_channel(guild_id, session.channel_id.as_deref().unwrap_or_default());
-            let stored = self.repo.embed(session.name.as_deref().unwrap_or_default())?;
+            let stored = self.repo.embed(&gid, session.name.as_deref().unwrap_or_default())?;
             let (Some(stored), Some(channel)) = (stored, channel) else {
                 self.reply(i, "Embed or destination channel is unavailable.").await;
                 return Ok(());
@@ -1502,7 +1568,7 @@ impl GaiaBot {
                 Some(guild) => resolve_mention(&guild, self.bot_id(), &requested),
                 None => resolve_mention_with(|_| false, false, &requested),
             };
-            let rendered = render_template(&self.repo, &stored.template_id, &stored.payload_json).await?;
+            let rendered = render_template(&self.repo, &gid, &stored.template_id, &stored.payload_json).await?;
             let message =
                 channel.id.send_message(&self.discord.http, with_delivery_mention(rendered, &resolved.mention).create_message()).await?;
             self.repo.track_sent_embed(&stored.template_id, &gid, &channel.id.to_string(), &message.id.to_string())?;
@@ -1513,7 +1579,7 @@ impl GaiaBot {
                 details: details(&[("Template", stored.name.clone())]),
                 ..audit_event("Embed Manually Sent", "Embeds", "success")
             });
-            self.embed_sessions.lock().unwrap().remove(token_or_guild);
+            self.embed_sessions.remove(token_or_guild);
             let mut fields = vec![
                 field("Embed", stored.name.clone(), true),
                 field("Destination", format!("<#{}>", channel.id), true),
@@ -1528,17 +1594,18 @@ impl GaiaBot {
         if i.is_channel_select() && action == "channel" {
             let token = piece(3);
             let channel = i.values().first().and_then(|id| self.text_channel(guild_id, id));
-            let claimed = {
-                let mut sessions = self.embed_sessions.lock().unwrap();
-                match (sessions.get_mut(token).filter(|s| s.user_id == uid && s.name.is_some()), channel) {
-                    (Some(session), Some(channel)) => {
-                        session.channel_id = Some(channel.id.to_string());
-                        session.mention = Some(DeliveryMention::default());
-                        true
-                    }
-                    _ => false,
-                }
-            };
+            let claimed = channel.is_some_and(|channel| {
+                self.embed_sessions
+                    .update(token, |s| {
+                        let owned = s.user_id == uid && s.guild_id == gid && s.name.is_some();
+                        if owned {
+                            s.channel_id = Some(channel.id.to_string());
+                            s.mention = Some(DeliveryMention::default());
+                        }
+                        owned
+                    })
+                    .unwrap_or(false)
+            });
             if !claimed {
                 self.reply(i, "That send session expired or the channel is unavailable.").await;
                 return Ok(());
@@ -1549,17 +1616,13 @@ impl GaiaBot {
     }
 
     /// Downloads a modal upload and stores it on the template (TS attachment upload branch).
-    async fn store_upload(&self, i: Ix<'_>, template_id: &str, template_name: &str, upload: FileUpload) -> anyhow::Result<()> {
+    async fn store_upload(&self, i: Ix<'_>, guild_id: &str, template_id: &str, template_name: &str, upload: FileUpload) -> anyhow::Result<()> {
         if upload.size > MAX_ATTACHMENT_BYTES as u64 {
             self.reply(i, &format!("Attachment exceeds the {} MB limit.", MAX_ATTACHMENT_BYTES / 1024 / 1024)).await;
             return Ok(());
         }
         let stored: anyhow::Result<()> = async {
-            let response = reqwest::Client::new().get(&upload.url).timeout(Duration::from_secs(15)).send().await?;
-            if !response.status().is_success() {
-                anyhow::bail!("Discord attachment download failed.");
-            }
-            let data = response.bytes().await?.to_vec();
+            let data = download_attachment(&upload.url, MAX_ATTACHMENT_BYTES, is_discord_cdn).await?;
             if data.len() as u64 != upload.size {
                 anyhow::bail!("Attachment size changed during upload.");
             }
@@ -1570,7 +1633,7 @@ impl GaiaBot {
                 data,
                 &i.user().id.to_string(),
             )?;
-            self.repo.save_attachment(&record)?;
+            self.repo.save_attachment(guild_id, &record, MAX_TEMPLATE_ATTACHMENTS, MAX_TEMPLATE_ATTACHMENT_BYTES)?;
             Ok(())
         }
         .await;
@@ -1598,19 +1661,17 @@ impl GaiaBot {
         let piece = |n: usize| pieces.get(n).copied().unwrap_or("");
         let (action, mode, raw) = (piece(1), piece(2), piece(3));
         let Some(guild_id) = i.guild_id else { return Ok(()) };
-        let member = self.fetch_member(guild_id, i.user.id).await;
-        let permitted = match &member {
-            Some(member) => self.has_level(member, PermissionLevel::Administrator).await,
-            None => false,
-        };
-        if !permitted {
+        if !self.is_embed_admin(guild_id, i.user.id).await {
             self.reply(ix, "You do not have permission to edit embeds.").await;
             return Ok(());
         }
         let (gid, uid) = (guild_id.to_string(), i.user.id.to_string());
         if action == "input" || action == "large" {
-            let name = decode_uri_component(raw)?;
-            let existing = self.repo.embed(&name)?;
+            let Some(name) = decode_uri_component(raw).ok().and_then(|n| template_name(&n)) else {
+                self.reply(ix, INVALID_NAME).await;
+                return Ok(());
+            };
+            let existing = self.repo.embed(&gid, &name)?;
             if action == "large" {
                 let inputs = (0..5)
                     .map(|n| {
@@ -1637,17 +1698,21 @@ impl GaiaBot {
             return Ok(());
         }
         if action == "save" {
-            let pending = self.pending_embeds.lock().unwrap().get(mode).cloned();
+            let pending = self.pending_embeds.get(mode);
             let Some(pending) = pending.filter(|p| p.user_id == uid && p.guild_id == gid) else {
                 self.reply(ix, "That preview expired. Please start again.").await;
                 return Ok(());
             };
-            if !self.repo.save_embed(&pending.name, &pending.json, &uid, Some(pending.replace))? {
+            if template_name(&pending.name).as_deref() != Some(pending.name.as_str()) {
+                self.reply(ix, INVALID_NAME).await;
+                return Ok(());
+            }
+            if !self.repo.save_embed(&gid, &pending.name, &pending.json, &uid, Some(pending.replace))? {
                 return self
                     .update(ix, CreateInteractionResponseMessage::new().content("That embed name already exists.").embeds(vec![]).components(vec![]))
                     .await;
             }
-            let tracked = match self.repo.embed(&pending.name)? {
+            let tracked = match self.repo.embed(&gid, &pending.name)? {
                 Some(stored) => self.repo.sent_embeds(&stored.template_id, &gid)?,
                 None => vec![],
             };
@@ -1655,7 +1720,7 @@ impl GaiaBot {
                 guild: subject(&gid, self.guild_name(guild_id)),
                 actor: subject(&uid, Some(i.user.tag())),
                 details: details(&[("Template", pending.name.clone())]),
-                ..audit_event(if pending.replace { "Global Embed Edited" } else { "Global Embed Created" }, "Embeds", "success")
+                ..audit_event(if pending.replace { "Embed Edited" } else { "Embed Created" }, "Embeds", "success")
             });
             let components = if tracked.is_empty() {
                 vec![]
@@ -1670,19 +1735,19 @@ impl GaiaBot {
                 .update(
                     ix,
                     CreateInteractionResponseMessage::new()
-                        .content(format!("Global embed **{}** saved.", pending.name))
+                        .content(format!("Embed **{}** saved.", pending.name))
                         .embeds(vec![])
                         .components(components),
                 )
                 .await;
         }
         if action == "update" {
-            let pending = self.pending_embeds.lock().unwrap().get(mode).cloned();
+            let pending = self.pending_embeds.get(mode);
             let Some(pending) = pending.filter(|p| p.user_id == uid && p.guild_id == gid) else {
                 self.reply(ix, "That update session expired.").await;
                 return Ok(());
             };
-            let Some(stored) = self.repo.embed(&pending.name)? else {
+            let Some(stored) = self.repo.embed(&gid, &pending.name)? else {
                 self.reply(ix, "That embed no longer exists.").await;
                 return Ok(());
             };
@@ -1712,7 +1777,7 @@ impl GaiaBot {
                     continue;
                 }
                 let edited: anyhow::Result<()> = async {
-                    let rendered = render_template(&self.repo, &stored.template_id, &stored.payload_json).await?;
+                    let rendered = render_template(&self.repo, &gid, &stored.template_id, &stored.payload_json).await?;
                     let edit = edit_from_rendered(with_delivery_mention(rendered, &DeliveryMention::default()));
                     channel.id.edit_message(&self.discord.http, message_id, edit).await?;
                     Ok(())
@@ -1727,7 +1792,7 @@ impl GaiaBot {
                     }
                 }
             }
-            self.pending_embeds.lock().unwrap().remove(mode);
+            self.pending_embeds.remove(mode);
             let mut content = format!("🟢 Updated {updated} sent embed{}.", if updated == 1 { "" } else { "s" });
             if stale > 0 {
                 content.push_str(&format!(
@@ -1738,6 +1803,9 @@ impl GaiaBot {
             return self.update(ix, CreateInteractionResponseMessage::new().content(content).components(vec![])).await;
         }
         if action == "cancel" {
+            if self.pending_embeds.get(mode).is_some_and(|p| p.user_id == uid && p.guild_id == gid) {
+                self.pending_embeds.remove(mode);
+            }
             return self
                 .update(ix, CreateInteractionResponseMessage::new().content("Embed changes cancelled.").embeds(vec![]).components(vec![]))
                 .await;
@@ -1749,7 +1817,15 @@ impl GaiaBot {
         let ix = Ix::Modal(i);
         let pieces: Vec<&str> = i.data.custom_id.split(':').collect();
         let mode = pieces.get(1).copied().unwrap_or("");
-        let name = decode_uri_component(pieces.get(2).copied().unwrap_or(""))?;
+        let Some(guild_id) = i.guild_id else { return Ok(()) };
+        if !self.is_embed_admin(guild_id, i.user.id).await {
+            self.reply(ix, "You need Discord Administrator permission to manage embeds.").await;
+            return Ok(());
+        }
+        let Some(name) = decode_uri_component(pieces.get(2).copied().unwrap_or("")).ok().and_then(|n| template_name(&n)) else {
+            self.reply(ix, INVALID_NAME).await;
+            return Ok(());
+        };
         let large = mode.starts_with("large-");
         let json = if large { (0..5).map(|n| ix.text(&format!("json{n}"))).collect::<String>() } else { ix.text("json") };
         let replace = if large { &mode[6..] == "edit" } else { mode == "edit" };
@@ -1769,17 +1845,19 @@ impl GaiaBot {
         };
         let Some(guild_id) = i.guild_id else { return Ok(()) };
         let token = session_token(6);
-        self.pending_embeds.lock().unwrap().insert(
+        let user_id = i.user.id.to_string();
+        self.pending_embeds.insert(
             token.clone(),
-            PendingEmbed { name, json, replace, user_id: i.user.id.to_string(), guild_id: guild_id.to_string() },
+            &user_id,
+            PendingEmbed { name, json, replace, user_id: user_id.clone(), guild_id: guild_id.to_string() },
         );
         let row = CreateActionRow::Buttons(vec![
-            button(format!("embedflow:save:{token}"), if replace { "Save Changes" } else { "Save Global Embed" }, ButtonStyle::Success),
+            button(format!("embedflow:save:{token}"), if replace { "Save Changes" } else { "Save Embed" }, ButtonStyle::Success),
             button(format!("embedflow:cancel:{token}"), "Cancel", ButtonStyle::Secondary),
         ]);
         // Raw JSON keeps the validated embeds byte-for-byte instead of round-tripping them through builders.
         let content = match value.get("content") {
-            None | Some(Value::Null) => json!("Preview — this global template is not saved until you confirm."),
+            None | Some(Value::Null) => json!("Preview — this template is not saved until you confirm."),
             Some(content) => content.clone(),
         };
         let mut data = json!({ "content": content, "components": [row], "flags": 64 });
@@ -1795,8 +1873,9 @@ impl GaiaBot {
             return Ok(());
         }
         let focused = i.data.autocomplete().map(|o| o.value.to_lowercase()).unwrap_or_default();
+        let Some(guild_id) = i.guild_id else { return Ok(()) };
         let mut response = CreateAutocompleteResponse::new();
-        for name in self.repo.embeds(Some(0), Some(25))?.into_iter().filter(|n| n.to_lowercase().contains(&focused)) {
+        for name in self.repo.embeds(&guild_id.to_string(), Some(0), Some(25))?.into_iter().filter(|n| n.to_lowercase().contains(&focused)) {
             response = response.add_string_choice(name.clone(), name);
         }
         i.create_response(&self.discord.http, CreateInteractionResponse::Autocomplete(response)).await?;
@@ -2048,5 +2127,294 @@ mod tests {
             Some(FileUpload { name: "a.png".into(), url: "https://cdn/a.png".into(), size: 3, content_type: Some("image/png".into()) })
         );
         assert_eq!(parse_file_upload(&json!({"data": {"components": []}}), "attachment"), None);
+    }
+
+    /// The real path: Discord's modal-submit JSON goes through (patched) serenity and back out intact.
+    #[test]
+    fn file_upload_survives_serenity_modal_deserialization() {
+        let raw = json!({
+            "id": "1", "application_id": "901", "type": 5, "token": "t", "version": 1, "guild_id": "1", "channel_id": "2",
+            "locale": "en-US", "entitlements": [], "authorizing_integration_owners": {}, "app_permissions": "0", "attachment_size_limit": 8388608,
+            "member": { "user": { "id": "5", "username": "u", "discriminator": "0", "global_name": null, "avatar": null },
+                        "roles": [], "joined_at": "2026-01-01T00:00:00.000000+00:00", "deaf": false, "mute": false, "flags": 0, "permissions": "8" },
+            "data": {
+                "custom_id": "embedui:attachmentupload:t",
+                "components": [{ "type": 18, "id": 1, "component": { "type": 19, "id": 2, "custom_id": "attachment", "values": ["99"] } }],
+                "resolved": { "attachments": { "99": { "id": "99", "filename": "a.png", "size": 3, "url": "https://cdn.discordapp.com/a.png",
+                                                     "proxy_url": "https://media.discordapp.net/a.png", "content_type": "image/png" } } }
+            }
+        });
+        let Interaction::Modal(modal) = serde_json::from_value::<Interaction>(raw).expect("serenity parses the modal") else {
+            panic!("not a modal interaction")
+        };
+        let upload = serde_json::to_value(&modal).ok().and_then(|raw| parse_file_upload(&raw, "attachment"));
+        assert_eq!(upload.map(|u| (u.name, u.size)), Some(("a.png".into(), 3)));
+    }
+
+    // ---- Embed Manager behaviour (fake Discord) ----
+    use crate::test_support::{GuildSeed, Harness};
+
+    const A: u64 = 1;
+    const B: u64 = 2;
+    const ADMIN: u64 = 5;
+    const OTHER_ADMIN: u64 = 8;
+    const MEMBER: u64 = 6;
+    const B_ADMIN: u64 = 7;
+
+    /// Guild A: admins 5 and 8, plain member 6, text channel 100, roles 30/31. Guild B: admin 7, channel 200.
+    async fn embed_harness() -> (Harness, GaiaBot) {
+        let h = Harness::start().await;
+        h.seed(
+            GuildSeed::new(A, "A")
+                .role(10, "Admin", 5, Permissions::ADMINISTRATOR)
+                .role(20, "Gaia", 10, Permissions::SEND_MESSAGES | Permissions::MENTION_EVERYONE)
+                .role(30, "News", 1, Permissions::empty())
+                .role(31, "Events", 1, Permissions::empty())
+                .channel(100, ChannelType::Text, None)
+                .bot(&[20])
+                .member(ADMIN, &[10])
+                .member(OTHER_ADMIN, &[10])
+                .member(MEMBER, &[]),
+        );
+        h.seed(
+            GuildSeed::new(B, "B")
+                .role(11, "Admin", 5, Permissions::ADMINISTRATOR)
+                .channel(200, ChannelType::Text, None)
+                .bot(&[])
+                .member(B_ADMIN, &[11]),
+        );
+        let bot = h.bot();
+        (h, bot)
+    }
+
+    async fn click(h: &Harness, bot: &GaiaBot, guild: u64, user: u64, id: &str) {
+        bot.on_interaction(&h.ctx(), &Interaction::Component(h.button(guild, user, id))).await;
+    }
+
+    async fn submit(h: &Harness, bot: &GaiaBot, guild: u64, user: u64, id: &str, fields: &[(&str, &str)]) {
+        bot.on_interaction(&h.ctx(), &Interaction::Modal(h.modal(guild, user, id, fields))).await;
+    }
+
+    async fn pick(h: &Harness, bot: &GaiaBot, guild: u64, user: u64, id: &str, kind: u8, values: &[&str]) {
+        bot.on_interaction(&h.ctx(), &Interaction::Component(h.select(guild, user, id, kind, values))).await;
+    }
+
+    fn last_reply(h: &Harness) -> Value {
+        h.replies().last().cloned().expect("no interaction response")
+    }
+
+    fn session(guild: u64, user: u64) -> Session {
+        Session { guild_id: guild.to_string(), user_id: user.to_string(), ..Default::default() }
+    }
+
+    #[tokio::test]
+    async fn rejects_embed_actions_after_administrator_permission_is_removed() {
+        let (h, bot) = embed_harness().await;
+        // TS removedAdministratorInteraction: the member's Administrator role is gone by the time they click.
+        h.seed(GuildSeed::new(A, "A").role(10, "Admin", 5, Permissions::ADMINISTRATOR).bot(&[]).member(ADMIN, &[]));
+        click(&h, &bot, A, ADMIN, "embedui:create:1").await;
+        let reply = last_reply(&h);
+        assert_eq!(reply["type"], 4, "no modal opened");
+        assert!(reply["data"]["content"].as_str().unwrap().contains("Administrator"));
+        click(&h, &bot, A, ADMIN, "embedflow:input:create:Name").await;
+        assert!(last_reply(&h)["data"]["content"].as_str().unwrap().contains("permission"));
+    }
+
+    #[tokio::test]
+    async fn forged_embed_modal_from_a_non_admin_is_rejected() {
+        let (h, bot) = embed_harness().await;
+        submit(&h, &bot, A, MEMBER, "embedmodal:create:Forged", &[("json", r#"{"content":"x"}"#)]).await;
+        assert!(last_reply(&h)["data"]["content"].as_str().unwrap().contains("Administrator"));
+        assert_eq!(bot.pending_embeds.len(), 0);
+        submit(&h, &bot, A, ADMIN, "embedmodal:create:Real", &[("json", r#"{"content":"x"}"#)]).await;
+        assert_eq!(last_reply(&h)["data"]["components"][0]["components"][0]["label"], "Save Embed");
+        assert_eq!(bot.pending_embeds.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn validates_template_names_from_custom_ids_and_modals() {
+        let (h, bot) = embed_harness().await;
+        let long = "x".repeat(65);
+        for id in ["embedmodal:create:bad%01name".to_string(), format!("embedmodal:create:{long}"), "embedmodal:create:%20%20".into()] {
+            submit(&h, &bot, A, ADMIN, &id, &[("json", r#"{"content":"x"}"#)]).await;
+            assert_eq!(last_reply(&h)["data"]["content"], INVALID_NAME, "{id}");
+        }
+        click(&h, &bot, A, ADMIN, "embedflow:input:create:a%0Ab").await;
+        assert_eq!(last_reply(&h)["data"]["content"], INVALID_NAME);
+        submit(&h, &bot, A, ADMIN, "embedui:name:create:1", &[("name", "tab\there")]).await;
+        assert_eq!(last_reply(&h)["data"]["content"], INVALID_NAME);
+        assert_eq!(bot.pending_embeds.len(), 0);
+        // A forged pending entry with a bad name is refused at save time too.
+        let pending = PendingEmbed { name: "a\u{7}".into(), json: "{}".into(), replace: false, user_id: ADMIN.to_string(), guild_id: A.to_string() };
+        bot.pending_embeds.insert("tok".into(), &ADMIN.to_string(), pending);
+        click(&h, &bot, A, ADMIN, "embedflow:save:tok").await;
+        assert_eq!(last_reply(&h)["data"]["content"], INVALID_NAME);
+        assert!(h.repo.embeds("1", None, None).unwrap().is_empty());
+        assert_eq!(template_name("  Weekly News  ").as_deref(), Some("Weekly News"));
+        assert!(template_name(&"é".repeat(64)).is_some());
+    }
+
+    #[tokio::test]
+    async fn saves_templates_per_guild_and_cannot_reach_another_guilds_templates() {
+        let (h, bot) = embed_harness().await;
+        // Guild B owns "Secret" with an attachment and a pending schedule.
+        h.repo.save_embed("2", "Secret", r#"{"content":"b only"}"#, "b", None).unwrap();
+        let tb = h.repo.embed("2", "Secret").unwrap().unwrap().template_id;
+        let png = crate::services::embed_renderer::attachment_record(&tb, "x.png", "image/png", b"\x89PNG\r\n\x1a\n".to_vec(), "b").unwrap();
+        h.repo.save_attachment("2", &png, 10, 1 << 20).unwrap();
+        let stamp = crate::db::now();
+        h.repo
+            .create_schedule(&ScheduledEmbedSend {
+                id: "sb".into(),
+                template_id: tb.clone(),
+                guild_id: "2".into(),
+                channel_id: "200".into(),
+                scheduled_for_utc: "2099-01-01T00:00:00.000Z".into(),
+                timezone: "Europe/Ljubljana".into(),
+                created_by_user_id: "b".into(),
+                created_at: stamp.clone(),
+                updated_by_user_id: "b".into(),
+                updated_at: stamp,
+                status: "scheduled".into(),
+                template_name_snapshot: "Secret".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // See: list/pickers only show guild A's (empty) library.
+        click(&h, &bot, A, ADMIN, "embedui:list:1").await;
+        assert_eq!(last_reply(&h)["data"]["content"], "No embeds have been saved in this server.");
+        click(&h, &bot, A, ADMIN, "embedui:send:1").await;
+        assert_eq!(last_reply(&h)["data"]["content"], "No embeds have been saved in this server.");
+        pick(&h, &bot, A, ADMIN, "embedui:attachmenttemplate:1", 3, &["Secret"]).await;
+        assert_eq!(last_reply(&h)["data"]["content"], "That embed no longer exists.");
+        // Delete: guild B's attachment survives a forged remove from guild A.
+        pick(&h, &bot, A, ADMIN, &format!("embedui:attachmentremove:{tb}"), 3, &["x.png"]).await;
+        assert_eq!(last_reply(&h)["data"]["content"], "That template no longer exists.");
+        assert_eq!(h.repo.attachments("2", &tb).unwrap().len(), 1);
+        // Send: a forged send session naming guild B's template finds nothing in guild A.
+        bot.embed_sessions.insert(
+            "send".into(),
+            "5",
+            Session { name: Some("Secret".into()), channel_id: Some("100".into()), ..session(A, ADMIN) },
+        );
+        click(&h, &bot, A, ADMIN, "embedui:manualconfirm:send").await;
+        assert_eq!(last_reply(&h)["data"]["content"], "Embed or destination channel is unavailable.");
+        assert!(h.calls_to("POST", "/channels/*/messages").is_empty());
+        // Schedules: guild B's schedule cannot be viewed or cancelled from guild A.
+        click(&h, &bot, A, ADMIN, "embedui:cancelschedule:sb").await;
+        assert_eq!(last_reply(&h)["data"]["content"], "That pending schedule is unavailable.");
+        click(&h, &bot, A, ADMIN, "embedui:cancelconfirm:sb").await;
+        assert_eq!(last_reply(&h)["data"]["content"], "Schedule was already changed or is unavailable.");
+        assert_eq!(h.repo.schedule("2", "sb").unwrap().unwrap().status, "scheduled");
+        // Edit: "editing" Secret from guild A creates guild A's own template and leaves B's untouched.
+        submit(&h, &bot, A, ADMIN, "embedmodal:edit:Secret", &[("json", r#"{"content":"a"}"#)]).await;
+        let token = last_reply(&h)["data"]["components"][0]["components"][0]["custom_id"].as_str().unwrap().replace("embedflow:save:", "");
+        click(&h, &bot, A, ADMIN, &format!("embedflow:save:{token}")).await;
+        assert_eq!(last_reply(&h)["data"]["content"], "Embed **Secret** saved.");
+        assert_eq!(h.repo.embed("1", "Secret").unwrap().unwrap().payload_json, r#"{"content":"a"}"#);
+        assert_eq!(h.repo.embed("2", "Secret").unwrap().unwrap().payload_json, r#"{"content":"b only"}"#);
+        click(&h, &bot, B, B_ADMIN, "embedui:list:2").await;
+        assert_eq!(last_reply(&h)["data"]["content"], "**Embeds**\n• Secret");
+    }
+
+    #[tokio::test]
+    async fn mention_back_cancel_and_schedule_cancel_require_session_ownership() {
+        let (h, bot) = embed_harness().await;
+        bot.embed_sessions.insert("m".into(), "5", Session { name: Some("N".into()), channel_id: Some("100".into()), ..session(A, ADMIN) });
+        bot.schedule_sessions.insert("s".into(), "5", session(A, ADMIN));
+        for id in ["embedui:mentionback:manual:m", "embedui:mentioncancel:manual:m", "embedui:schedulecancel:s"] {
+            click(&h, &bot, A, OTHER_ADMIN, id).await;
+            assert_eq!(last_reply(&h)["type"], 4, "{id}: refused with a reply, not an update");
+        }
+        assert!(bot.embed_sessions.get("m").is_some(), "another admin cannot cancel the session");
+        assert!(bot.schedule_sessions.get("s").is_some());
+        click(&h, &bot, A, ADMIN, "embedui:mentionback:manual:m").await;
+        assert_eq!(last_reply(&h)["type"], 7);
+        click(&h, &bot, A, ADMIN, "embedui:mentioncancel:manual:m").await;
+        assert!(bot.embed_sessions.get("m").is_none());
+        click(&h, &bot, A, ADMIN, "embedui:schedulecancel:s").await;
+        assert!(bot.schedule_sessions.get("s").is_none());
+    }
+
+    #[tokio::test]
+    async fn embedflow_cancel_drops_the_pending_preview() {
+        let (h, bot) = embed_harness().await;
+        submit(&h, &bot, A, ADMIN, "embedmodal:create:Draft", &[("json", r#"{"content":"x"}"#)]).await;
+        let cancel = last_reply(&h)["data"]["components"][0]["components"][1]["custom_id"].as_str().unwrap().to_string();
+        click(&h, &bot, A, OTHER_ADMIN, &cancel).await;
+        assert_eq!(bot.pending_embeds.len(), 1, "only the owner's cancel drops it");
+        click(&h, &bot, A, ADMIN, &cancel).await;
+        assert_eq!(bot.pending_embeds.len(), 0);
+        assert_eq!(last_reply(&h)["data"]["content"], "Embed changes cancelled.");
+    }
+
+    #[test]
+    fn sessions_expire_after_ttl_and_are_capped_per_user() {
+        let store = SessionStore::<u32>::default();
+        store.insert("old".into(), "u", 1);
+        store.backdate("old", SESSION_TTL);
+        assert_eq!(store.get("old"), None, "expired entries are invisible");
+        assert_eq!(store.update("old", |v| *v), None);
+        store.insert("new".into(), "u", 2);
+        store.backdate("new", Duration::from_secs(1));
+        assert_eq!(store.len(), 1, "insert sweeps expired entries");
+        store.insert("other".into(), "v", 9);
+        for n in 0..SESSIONS_PER_USER {
+            store.insert(format!("t{n}"), "u", n as u32);
+        }
+        assert_eq!(store.get("new"), None, "the user's oldest session is evicted at the cap");
+        assert_eq!(store.get("other"), Some(9), "other users are unaffected");
+        assert_eq!(store.len(), SESSIONS_PER_USER + 1);
+    }
+
+    #[tokio::test]
+    async fn routes_native_role_selection_into_a_manual_delivery_mention_session() {
+        let (h, bot) = embed_harness().await;
+        let s = Session { name: Some("Notice".into()), channel_id: Some("100".into()), mention: Some(DeliveryMention::default()), ..session(A, ADMIN) };
+        bot.embed_sessions.insert("token".into(), "5", s);
+        pick(&h, &bot, A, ADMIN, "embedui:mentionroles:manual:token", 6, &["30", "31"]).await;
+        assert_eq!(
+            bot.embed_sessions.get("token").unwrap().mention,
+            Some(DeliveryMention { roles: vec!["30".into(), "31".into()], everyone: false, here: false })
+        );
+        let reply = last_reply(&h);
+        assert_eq!(reply["type"], 7);
+        assert_eq!(reply["data"]["embeds"][0]["title"], "Mention Settings");
+        // Another admin cannot mutate the session.
+        pick(&h, &bot, A, OTHER_ADMIN, "embedui:mentionroles:manual:token", 6, &["30"]).await;
+        assert_eq!(bot.embed_sessions.get("token").unwrap().mention.unwrap().roles.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn scheduled_sends_persist_and_deliver_the_chosen_mention() {
+        let (h, bot) = embed_harness().await;
+        h.repo.save_embed("1", "Notice", r#"{"content":"hello"}"#, "admin", None).unwrap();
+        let t = h.repo.embed("1", "Notice").unwrap().unwrap().template_id;
+        let due = (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let mention = DeliveryMention { roles: vec!["30".into()], everyone: false, here: false };
+        let s = Session {
+            name: Some("Notice".into()),
+            template_id: Some(t),
+            channel_id: Some("100".into()),
+            utc: Some(due),
+            display: Some("soon".into()),
+            mention: Some(mention.clone()),
+            ..session(A, ADMIN)
+        };
+        bot.schedule_sessions.insert("sched".into(), "5", s);
+        click(&h, &bot, A, ADMIN, "embedui:scheduleconfirm:sched").await;
+        assert_eq!(last_reply(&h)["data"]["embeds"][0]["title"], "Embed Scheduled");
+        let stored = h.repo.upcoming_schedules("1", None).unwrap();
+        assert_eq!(parse_mention(stored[0].mention_json.as_deref()), mention, "mention is persisted");
+
+        let scheduler = EmbedScheduler::new(h.repo.clone(), h.discord.clone(), None);
+        scheduler.tick(chrono::Utc::now()).await.unwrap();
+        let sent = h.calls_to("POST", "/channels/100/messages");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].body["content"], "<@&30>\nhello");
+        assert_eq!(sent[0].body["allowed_mentions"]["roles"], json!(["30"]));
+        let history = h.repo.schedule_history("1", None).unwrap();
+        assert_eq!(history[0].status, "sent");
     }
 }

@@ -1,6 +1,6 @@
 # Gaia
 
-Gaia is a production-oriented, multi-server Discord bot with guild-isolated configuration, staff moderation, automatic roles, join-to-create voice rooms, and a deliberately global embed template library.
+Gaia is a production-oriented, multi-server Discord bot with guild-isolated configuration, staff moderation, automatic roles, join-to-create voice rooms, and a per-server embed template library.
 
 ## Layout
 
@@ -22,7 +22,7 @@ Gaia is written in **Rust** and **Ruby**:
 
 ## Discord setup
 
-Enable the **Server Members Intent**. Install Gaia using an OAuth2 URL with both `bot` and `applications.commands` scopes; the latter is required for slash commands to appear. Request only these bot permissions: View Channels, Send Messages, Embed Links, Attach Files, Use Application Commands, Manage Roles, Manage Channels, Move Members, Connect, and Speak. Gaia does not need Administrator. `Manage Channels` is needed for temporary rooms and member-specific mute overwrites; `Manage Roles` is needed for AutoRole and Verification. If commands are missing, verify that the token, authenticated application ID, and OAuth application are the same application.
+Enable the **Server Members Intent**. Install Gaia using an OAuth2 URL with both `bot` and `applications.commands` scopes; the latter is required for slash commands to appear. Request these bot permissions: View Channels, Send Messages, Embed Links, Attach Files, Use Application Commands, Manage Roles, Manage Channels, Move Members, Connect, Speak, Kick Members and Manage Messages (permissions integer `2435902482`). Add Manage Server and Mention Everyone (`2436033586` in total) if you will restore backups onto a server or send embeds that ping @everyone/@here. Gaia does not need Administrator. `Manage Channels` is needed for temporary rooms and member-specific mute overwrites; `Manage Roles` is needed for AutoRole and Verification. `Kick Members` and `Manage Messages` are needed for the verification-channel honeypot, which deletes any message posted there, DMs the author a rejoin invite and kicks them. If commands are missing, verify that the token, authenticated application ID, and OAuth application are the same application.
 
 ## Commands and permissions
 
@@ -32,14 +32,14 @@ Administrators are checked at runtime against Discord's actual Administrator per
 | --- | --- |
 | `/admin` (interactive administration dashboard) | Administrator |
 | `/mute`, `/unmute` | Gaia Staff or Administrator |
-| `/embed` (interactive global embed manager) | Administrator |
+| `/embed` (interactive per-server embed manager) | Administrator |
 | `/unverify` | Administrator |
 
-`/admin` has no options: it opens an ephemeral dashboard with AutoRole, Voice Rooms, Staff, and Moderation sections. Each section uses native Discord role, user, and channel pickers, and changes persist immediately. `/embed` likewise opens an ephemeral manager for creating, editing, sending, listing, and viewing global templates.
+`/admin` has no options: it opens an ephemeral dashboard with AutoRole, Voice Rooms, Staff, and Moderation sections. Each section uses native Discord role, user, and channel pickers, and changes persist immediately. `/embed` likewise opens an ephemeral manager for creating, editing, sending, listing, and viewing this server's templates.
 
 ## Storage model
 
-All guild-specific operations are keyed by `guild_id`: settings/toggles, autoroles, staff, voice configuration and rooms, room preferences and access lists, and active mutes. The database enforces one active room per owner within a guild. Saved `global_embeds` are intentionally the only cross-guild data.
+All guild-specific operations are keyed by `guild_id`: settings/toggles, autoroles, staff, voice configuration and rooms, room preferences and access lists, active mutes, and embed templates (`embed_templates`) together with their attachments, schedules and sent-message tracking. The database enforces one active room per owner within a guild. A server can never list, view, edit, send, schedule or remove attachments of another server's template. Templates saved before embeds became per-server (migration 0011) are adopted by the one server that had sent or scheduled them, or by the only server Gaia knew if they were never used; any other legacy template is kept but hidden from every server.
 
 ## Voice rooms
 
@@ -65,7 +65,9 @@ Cross-guild restore requires Administrator in the destination **and** current Ad
 
 ## Embed JSON
 
-Embed payloads are message JSON, for example `{"content":"Hello","embeds":[{"title":"Welcome","description":"..."}]}`. Gaia validates JSON syntax, Discord message/embed limits, fields, and HTTP(S) URLs before saving. Names are globally unique, case-insensitively. Gaia tracks embeds it sends from this release onward; after editing, an administrator can update tracked copies in the current guild in place. Previously sent messages are intentionally not retroactively discovered.
+Embed payloads are message JSON, for example `{"content":"Hello","embeds":[{"title":"Welcome","description":"..."}]}`. Gaia validates JSON syntax, Discord message/embed limits, fields, and HTTP(S) URLs before saving. Names are unique per server, case-insensitively (1–64 characters, no control characters). Gaia tracks embeds it sends from this release onward; after editing, an administrator can update tracked copies in the current guild in place. Previously sent messages are intentionally not retroactively discovered.
+
+Attachments are uploaded from the Embed Manager. Gaia only downloads them from `https://cdn.discordapp.com` or `https://media.discordapp.net` (no redirects, 15-second timeout), stops reading past 8 MB, and checks that the bytes match the declared type (PNG, JPEG, GIF, WEBP, PDF, or UTF-8 plain text). A template holds at most 10 attachments totalling 20 MB. Embed Manager sessions and unsaved previews expire after 15 minutes, and each administrator has at most five open at a time.
 
 ## Operations and troubleshooting
 
@@ -79,7 +81,7 @@ For a read-only production diagnosis, run `rake commands:inspect`. It fetches th
 
 Use persistent storage, run `bundle install`, `rake migrate`, `rake build`, then run `target/release/gaia`. Copy `.env.example` to `.env`; it contains placeholders only and must never be committed. Gaia exits non-zero when required configuration is missing, and handles `SIGINT`/`SIGTERM` by stopping mute timers, disconnecting Discord, and closing SQLite. Run it under systemd, Docker or another supervisor that restarts non-zero exits.
 
-Back up the SQLite database while the process is stopped, or use SQLite's online backup tooling so the WAL file is included consistently. WAL mode and a five-second busy timeout are enabled. On removal from a guild, Gaia purges that guild's operational configuration, rooms, mutes, restoration records, and sent-embed tracking; global embed templates are intentionally retained. Logs are JSON written to stdout, so collect them through your process manager.
+Back up the SQLite database while the process is stopped, or use SQLite's online backup tooling so the WAL file is included consistently. WAL mode and a five-second busy timeout are enabled. On removal from a guild, Gaia purges that guild's operational configuration, rooms, mutes, restoration records, and embed templates with their attachments, schedules (including history) and sent-embed tracking. Re-inviting Gaia starts with an empty template library. Logs are JSON written to stdout, so collect them through your process manager.
 
 ### Deploying with Docker / Coolify
 

@@ -56,3 +56,13 @@ class TestPermissions < Minitest::Test
     assert_equal Gaia::CommandSync::ALL_PERMISSIONS, Gaia::CommandSync.effective_permissions(GUILD, member.call('owner', []))
   end
 end
+
+class TestLogger < Minitest::Test
+  def test_redacts_plain_and_versioned_webhook_urls_and_tokens
+    plain = 'https://discord.com/api/webhooks/123456789012345678/abc-DEF_1'
+    versioned = 'https://discord.com/api/v10/webhooks/123456789012345678/secret-Token_9'
+    token = 'MTIzNDU2Nzg5MDEyMzQ1Njc4OTA.GhIjKl.abcdefghijklmnopqrstuvwxyz12'
+    assert_equal '[redacted webhook] [redacted webhook] [redacted token]',
+                 Gaia::Logger.redact("#{plain} #{versioned} #{token}")
+  end
+end
