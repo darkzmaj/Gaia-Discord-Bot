@@ -461,4 +461,52 @@ mod tests {
         service.idle().await;
         assert_eq!(posts.load(Ordering::SeqCst), 2);
     }
+
+    /// Live check against the real webhooks in `.env`: `cargo test live_log_delivery -- --ignored --nocapture`.
+    /// Posts one test join + leave to the member log and one test event to the audit log, printing each HTTP status.
+    #[tokio::test]
+    #[ignore = "posts to the real Discord webhooks configured in .env"]
+    async fn live_log_delivery() {
+        use crate::services::audit_log_service::{validate_audit_log_config, AuditEvent, AuditLogService};
+        let config = crate::config::Config::from_env();
+        let statuses = Arc::new(Mutex::new(Vec::<(String, u16)>::new()));
+        let recording = |label: &'static str| -> WebhookTransport {
+            let real = reqwest_transport(reqwest::Client::new());
+            let statuses = statuses.clone();
+            Arc::new(move |url: String, body: Option<String>| {
+                let (real, statuses) = (real.clone(), statuses.clone());
+                let method = if body.is_some() { "POST" } else { "GET" };
+                Box::pin(async move {
+                    let response = real(url, body).await;
+                    let status = response.as_ref().map_or(0, |r| r.status);
+                    statuses.lock().unwrap().push((format!("{label} {method}"), status));
+                    response
+                })
+            })
+        };
+
+        println!("member log config: {:?}", validate_member_log_config(&config.member_logging).map(|_| "valid"));
+        let members = MemberLogService::with_transport(config.member_logging.clone(), recording("member-log"));
+        members.initialize().await;
+        let subject = MemberLogSubject {
+            user_id: "0".into(),
+            username: "Gaia log test (ignore)".into(),
+            guild_id: "0".into(),
+            guild_name: "Gaia live log check".into(),
+            ..Default::default()
+        };
+        members.record_subject_join(subject.clone(), None);
+        members.record_subject_leave(subject, None);
+        members.idle().await;
+
+        println!("audit log config: {:?}", validate_audit_log_config(&config.audit_logging).map(|_| "valid"));
+        let audit = AuditLogService::with_transport(config.audit_logging.clone(), recording("audit-log"));
+        audit.initialize().await;
+        audit.record(AuditEvent { title: "Gaia log test (ignore)".into(), category: "Bot".into(), ..Default::default() });
+        audit.idle().await;
+
+        for (call, status) in statuses.lock().unwrap().iter() {
+            println!("{call}: HTTP {status}");
+        }
+    }
 }
