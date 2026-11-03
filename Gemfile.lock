@@ -1,7 +1,11 @@
 GEM
   remote: https://rubygems.org/
   specs:
-    minitest (5.27.0)
+    drb (2.2.3)
+    minitest (6.0.6)
+      drb (~> 2.0)
+      prism (~> 1.5)
+    prism (1.9.0)
     rake (13.4.2)
     sqlite3 (2.10.2-aarch64-linux-gnu)
     sqlite3 (2.10.2-x64-mingw-ucrt)
@@ -13,7 +17,7 @@ PLATFORMS
   x86_64-linux
 
 DEPENDENCIES
-  minitest (~> 5.25)
+  minitest (~> 6.0)
   rake (~> 13.2)
   sqlite3 (~> 2.1)
 
