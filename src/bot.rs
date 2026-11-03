@@ -19,7 +19,7 @@ use crate::services::embed_scheduler::EmbedScheduler;
 use crate::services::embed_validation::validate_embed_payload;
 use crate::services::member_log_service::MemberLogService;
 use crate::services::mute_service::MuteService;
-use crate::services::schedule_time::parse_ljubljana_schedule;
+use crate::services::schedule_time::parse_schedule;
 use crate::services::verification_service::VerificationService;
 use crate::services::voice_room_service::VoiceRoomService;
 use serenity::all::{
@@ -604,10 +604,10 @@ impl GaiaBot {
         let guilds = self.discord.cache.guilds();
         logger::info(
             "Gaia started",
-            ctx! {"guilds" => guilds.len(), "userId" => self.bot_id().to_string(), "applicationId" => self.discord.http.application_id().map(|a| a.to_string())},
+            ctx! {"version" => env!("CARGO_PKG_VERSION"), "guilds" => guilds.len(), "timezone" => crate::config::timezone().name(), "userId" => self.bot_id().to_string(), "applicationId" => self.discord.http.application_id().map(|a| a.to_string())},
         );
         self.audit.record(AuditEvent {
-            details: vec![("Guilds".into(), json!(guilds.len())), ("Version".into(), json!("1.0.0"))],
+            details: vec![("Guilds".into(), json!(guilds.len())), ("Version".into(), json!(env!("CARGO_PKG_VERSION")))],
             ..audit_event("Gaia Started", "Bot", "success")
         });
         // Webhook destination validation is observability-only and never affects startup.
@@ -1455,8 +1455,8 @@ impl GaiaBot {
                 self.reply(i, "That schedule session expired or the channel is unavailable.").await;
                 return Ok(());
             }
-            let input = CreateInputText::new(InputTextStyle::Short, "YYYY-MM-DD HH:mm (Europe/Ljubljana)", "time")
-                .placeholder("2026-08-30 18:30")
+            let input = CreateInputText::new(InputTextStyle::Short, "Date and time (YYYY-MM-DD HH:mm)", "time")
+                .placeholder(format!("2026-08-30 18:30 ({})", crate::config::timezone().name()))
                 .required(true)
                 .max_length(32);
             i.respond(&self.discord, text_modal(format!("embedui:time:{token}"), "Schedule delivery", vec![input])).await?;
@@ -1468,7 +1468,7 @@ impl GaiaBot {
                 self.reply(i, "That schedule session expired.").await;
                 return Ok(());
             }
-            match parse_ljubljana_schedule(&i.text("time"), chrono::Utc::now()) {
+            match parse_schedule(&i.text("time"), chrono::Utc::now()) {
                 Ok(parsed) => {
                     self.schedule_sessions.update(token_or_guild, |session| {
                         session.utc = Some(parsed.utc.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
@@ -1515,7 +1515,7 @@ impl GaiaBot {
                 guild_id: gid.clone(),
                 channel_id: channel_id.clone(),
                 scheduled_for_utc: utc.clone(),
-                timezone: "Europe/Ljubljana".into(),
+                timezone: crate::config::timezone().name().into(),
                 created_by_user_id: uid.clone(),
                 created_at: stamp.clone(),
                 updated_by_user_id: uid.clone(),
@@ -1875,6 +1875,11 @@ impl GaiaBot {
         let focused = i.data.autocomplete().map(|o| o.value.to_lowercase()).unwrap_or_default();
         let Some(guild_id) = i.guild_id else { return Ok(()) };
         let mut response = CreateAutocompleteResponse::new();
+        // Template names are admin-only, even if a server grants /embed to other roles.
+        if !self.is_embed_admin(guild_id, i.user.id).await {
+            i.create_response(&self.discord.http, CreateInteractionResponse::Autocomplete(response)).await?;
+            return Ok(());
+        }
         for name in self.repo.embeds(&guild_id.to_string(), Some(0), Some(25))?.into_iter().filter(|n| n.to_lowercase().contains(&focused)) {
             response = response.add_string_choice(name.clone(), name);
         }

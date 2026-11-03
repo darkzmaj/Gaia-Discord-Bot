@@ -2,6 +2,12 @@
 name = "gaia"
 version = "1.0.0"
 edition = "2021"
+rust-version = "1.85"
+authors = ["DarkZmaj"]
+license = "MIT"
+description = "Gaia: a multi-server Discord moderation and utility bot"
+repository = "https://github.com/darkzmaj/Gaia-Discord-Bot"
+readme = "README.md"
 publish = false
 
 [dependencies]
@@ -29,6 +35,7 @@ percent-encoding = "2"
 [profile.release]
 strip = true
 
-# serenity 0.12.5 plus two raw fields so modal FileUpload submissions (Label + resolved attachments) survive parsing.
+# serenity 0.12.5 plus two raw fields so modal FileUpload submissions (Label + resolved attachments) survive parsing,
+# and tokio-tungstenite 0.24 so the gateway uses a patched rustls 0.23 (0.21 pulled in rustls 0.22 with RustSec advisories).
 [patch.crates-io]
 serenity = { path = "vendor/serenity" }

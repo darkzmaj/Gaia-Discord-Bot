@@ -12,7 +12,6 @@ use crate::services::authorization::is_administrator;
 use crate::services::locks::KeyedLock;
 use base64::Engine;
 use chrono::{DateTime, Timelike, Utc};
-use chrono_tz::Europe::Ljubljana;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use serenity::builder::{CreateEmbed, CreateMessage, EditMessage};
@@ -275,7 +274,7 @@ pub fn system_channel_flags_from_snapshot(value: &Value) -> anyhow::Result<u64> 
     };
     match serialized.parse::<u128>() {
         Ok(bits) if bits & !SUPPORTED_SYSTEM_CHANNEL_FLAGS == 0 => Ok(bits as u64),
-        _ => anyhow::bail!("systemChannelFlags contains flags unsupported by this discord.js version."),
+        _ => anyhow::bail!("systemChannelFlags contains flags unsupported by this Gaia version."),
     }
 }
 
@@ -433,17 +432,17 @@ fn overwrite_count(channel: &Value) -> usize {
     channel["overwrites"].as_array().map_or(0, Vec::len)
 }
 
-fn ljubljana_hour(date: DateTime<Utc>) -> u32 {
-    date.with_timezone(&Ljubljana).hour()
+fn local_hour(date: DateTime<Utc>) -> u32 {
+    date.with_timezone(&crate::config::timezone()).hour()
 }
 
 fn date_key(date: DateTime<Utc>) -> String {
-    date.with_timezone(&Ljubljana).format("%Y-%m-%d").to_string()
+    date.with_timezone(&crate::config::timezone()).format("%Y-%m-%d").to_string()
 }
 
-/// One automatic backup per Europe/Ljubljana day, from 03:00 on (missed runs catch up later that day).
+/// One automatic backup per local (TIMEZONE) day, from BACKUP_HOUR on (missed runs catch up later that day).
 pub fn automatic_backup_due(settings: &BackupSettings, now: DateTime<Utc>) -> bool {
-    if ljubljana_hour(now) < 3 || settings.automatic_enabled == 0 {
+    if local_hour(now) < crate::config::backup_hour() || settings.automatic_enabled == 0 {
         return false;
     }
     let done_today = settings
@@ -960,7 +959,7 @@ impl BackupService {
     }
 
     pub async fn run_automatic(&self, now: DateTime<Utc>) -> anyhow::Result<()> {
-        if ljubljana_hour(now) < 3 {
+        if local_hour(now) < crate::config::backup_hour() {
             return Ok(());
         }
         for guild_id in self.discord.cache.guilds() {

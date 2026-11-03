@@ -1,22 +1,27 @@
 services:
   gaia:
+    # Prebuilt image from GitHub Container Registry; `docker compose build` builds it from source instead.
+    image: ghcr.io/darkzmaj/gaia-discord-bot:latest
     build:
       context: .
       dockerfile: Dockerfile
-    image: gaia-discord-bot:latest
     container_name: gaia-discord-bot
     restart: unless-stopped
+    # Values come from .env next to this file (created by the installer) or from your platform's
+    # environment settings (Coolify, Portainer, ...). See .env.example for what each one does.
     environment:
-      DISCORD_TOKEN: ${DISCORD_TOKEN}
+      DISCORD_TOKEN: ${DISCORD_TOKEN:?Set DISCORD_TOKEN in .env}
       DATABASE_PATH: /app/data/gaia.sqlite
-      APPLICATION_ID: ${APPLICATION_ID}
-      DIAGNOSTIC_GUILD_ID: ${DIAGNOSTIC_GUILD_ID}
-      DIAGNOSTIC_USER_ID: ${DIAGNOSTIC_USER_ID}
-      LOG_GUILD: ${LOG_GUILD}
-      LOG_GUILD_CHANNEL: ${LOG_GUILD_CHANNEL}
-      MEMBER_LOG_CHANNEL: ${MEMBER_LOG_CHANNEL}
-      LOG_WEBHOOK_URL: ${LOG_WEBHOOK_URL}
-      MEMBER_LOG_WEBHOOK_URL: ${MEMBER_LOG_WEBHOOK_URL}
+      APPLICATION_ID: ${APPLICATION_ID:-}
+      TIMEZONE: ${TIMEZONE:-}
+      BACKUP_HOUR: ${BACKUP_HOUR:-}
+      DIAGNOSTIC_GUILD_ID: ${DIAGNOSTIC_GUILD_ID:-}
+      DIAGNOSTIC_USER_ID: ${DIAGNOSTIC_USER_ID:-}
+      LOG_GUILD: ${LOG_GUILD:-}
+      LOG_GUILD_CHANNEL: ${LOG_GUILD_CHANNEL:-}
+      MEMBER_LOG_CHANNEL: ${MEMBER_LOG_CHANNEL:-}
+      LOG_WEBHOOK_URL: ${LOG_WEBHOOK_URL:-}
+      MEMBER_LOG_WEBHOOK_URL: ${MEMBER_LOG_WEBHOOK_URL:-}
     volumes:
       - gaia-data:/app/data
     # No inbound ports: this is an outbound-only Discord gateway connection.
@@ -30,6 +35,11 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     deploy:
       resources:
         limits:

@@ -113,10 +113,10 @@ fn parse_time(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::parse_from_rfc3339(value).ok().map(|t| t.with_timezone(&chrono::Utc))
 }
 
-/// `new Date(iso).toLocaleString("en-GB", { timeZone: "Europe/Ljubljana" })`.
-fn ljubljana(value: &str) -> String {
+/// en-GB date and time in the configured TIMEZONE.
+fn local_time(value: &str) -> String {
     parse_time(value)
-        .map(|t| t.with_timezone(&chrono_tz::Europe::Ljubljana).format("%d/%m/%Y, %H:%M:%S").to_string())
+        .map(|t| t.with_timezone(&crate::config::timezone()).format("%d/%m/%Y, %H:%M:%S").to_string())
         .unwrap_or_else(|| "Invalid Date".into())
 }
 
@@ -588,7 +588,7 @@ impl AdminUi {
         let content = format!(
             "🟢 Backup Created\n\n{} • {}\nRoles: {} • Channels: {} • Members: {}",
             backup.source_guild_name,
-            ljubljana(&backup.created_at),
+            local_time(&backup.created_at),
             backup.role_count,
             backup.channel_count,
             backup.member_count
@@ -938,7 +938,7 @@ impl AdminUi {
             let description = format!(
                 "**{}** • {}\n{}\n\n**Identity**\nName: Captured\nDescription: {}\nIcon: {icon}\nCommunity: {}\n\n**Structure**\nRoles: {}\nChannels: {}\nMember assignments: {}\nPermission overwrites: {}\nStorage: {:.2} MB\nSchema: v{}{}",
                 backup.source_guild_name,
-                ljubljana(&backup.created_at),
+                local_time(&backup.created_at),
                 backup.creation_type,
                 if guild.get("description").is_some() { "Captured" } else { "Legacy backup" },
                 if guild["communityEnabled"].as_bool() == Some(true) { "Enabled" } else { "Disabled" },
@@ -1335,12 +1335,16 @@ impl AdminUi {
                 let automatic = settings.automatic_enabled != 0;
                 let latest = backups
                     .first()
-                    .map(|b| format!("{} • {}", b.source_guild_name, ljubljana(&b.created_at)))
+                    .map(|b| format!("{} • {}", b.source_guild_name, local_time(&b.created_at)))
                     .unwrap_or_else(|| "None".into());
                 let storage = backups.iter().map(|b| b.snapshot_size as f64).sum::<f64>() / 1024.0 / 1024.0;
                 let description = format!(
                     "Automatic Backups: {}\n\nStored Backups: {} / 2\nLatest Backup: {latest}\nStorage: {storage:.2} MB\n\nConfiguration snapshots include roles, supported channels, overwrites, member role assignments, and Gaia configuration. They do not include messages, DMs, integrations, managed roles, or a byte-for-byte server image.",
-                    if automatic { "🟢 Enabled — daily at 03:00 Europe/Ljubljana" } else { "⚪ Disabled" },
+                    if automatic {
+                        format!("🟢 Enabled — daily at {:02}:00 {}", crate::config::backup_hour(), crate::config::timezone().name())
+                    } else {
+                        "⚪ Disabled".into()
+                    },
                     backups.len()
                 );
                 Ok(View::embed(
@@ -1721,8 +1725,8 @@ mod tests {
 
     #[test]
     fn dates_use_ljubljana_time() {
-        assert_eq!(ljubljana("2026-01-01T00:00:00.000Z"), "01/01/2026, 01:00:00");
-        assert_eq!(ljubljana("2026-07-01T00:00:00.000Z"), "01/07/2026, 02:00:00");
+        assert_eq!(local_time("2026-01-01T00:00:00.000Z"), "01/01/2026, 01:00:00");
+        assert_eq!(local_time("2026-07-01T00:00:00.000Z"), "01/07/2026, 02:00:00");
         assert!(deployment_token().len() >= 8);
     }
 }

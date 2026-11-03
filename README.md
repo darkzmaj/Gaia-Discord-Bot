@@ -1,8 +1,47 @@
 # Gaia
 
-Gaia is a production-oriented, multi-server Discord bot with guild-isolated configuration, staff moderation, automatic roles, join-to-create voice rooms, and a per-server embed template library.
+[![CI](https://github.com/darkzmaj/Gaia-Discord-Bot/actions/workflows/ci.yml/badge.svg)](https://github.com/darkzmaj/Gaia-Discord-Bot/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Version](https://img.shields.io/badge/version-1.0.0-green.svg)
 
-## Layout
+Gaia is a production-ready, self-hosted, multi-server Discord bot with guild-isolated configuration, staff moderation, automatic roles, verification, join-to-create voice rooms, configuration backups and a per-server embed template library. It is written in Rust, needs no Administrator permission, and is configured almost entirely from inside Discord.
+
+## Quick start
+
+1. Create an application at the [Discord Developer Portal](https://discord.com/developers/applications). Under **Bot**, click **Reset Token** and copy the token, then turn on **Server Members Intent**.
+2. Run the installer on any machine with [Docker](https://docs.docker.com/get-docker/) and git.
+
+   **Linux / macOS / WSL**
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/darkzmaj/Gaia-Discord-Bot/main/install.sh | bash
+   ```
+   **Windows (PowerShell)**
+   ```powershell
+   irm https://raw.githubusercontent.com/darkzmaj/Gaia-Discord-Bot/main/install.ps1 | iex
+   ```
+   It asks for your token, application ID, timezone and backup hour. Then it saves them to `.env`, pulls the prebuilt image (or builds it) and starts Gaia. If you gave an application ID, it prints an invite link at the end.
+3. Invite Gaia (see [Discord setup](#discord-setup)) and run `/admin` in your server.
+
+**Update:** re-run the same command. **Logs:** `docker compose logs -f`. **Stop:** `docker compose down`. These run in the install folder, which defaults to `~/gaia-discord-bot` (set `GAIA_DIR` to change it). Your data lives in the `gaia-data` Docker volume and survives updates.
+
+## Configuration
+
+Almost everything (AutoRole, verification, voice rooms, staff, moderation, backups, embeds) is configured per server with `/admin` and `/embed`. Operator-level settings live in `.env` (see [`.env.example`](.env.example)). Edit `.env`, then re-run the installer or `docker compose up -d`.
+
+| Variable | Required | Default | Purpose |
+| --- | --- | --- | --- |
+| `DISCORD_TOKEN` | yes | — | Bot token. |
+| `APPLICATION_ID` | no | — | Safety check that the token belongs to this application. |
+| `TIMEZONE` | no | `Europe/Ljubljana` | IANA timezone for scheduled embeds, daily backups and shown dates (e.g. `UTC`, `America/New_York`). |
+| `BACKUP_HOUR` | no | `3` | Local hour (0–23) the daily automatic backup runs, when enabled in `/admin`. |
+| `DATABASE_PATH` | no | `./data/gaia.sqlite` | SQLite file (fixed to `/app/data/gaia.sqlite` in Docker). |
+| `LOG_WEBHOOK_URL`, `LOG_GUILD`, `LOG_GUILD_CHANNEL` | no | — | Operator-wide staff/audit log destination. |
+| `MEMBER_LOG_WEBHOOK_URL`, `MEMBER_LOG_CHANNEL` | no | — | Operator-wide join/leave log destination. |
+| `DIAGNOSTIC_GUILD_ID`, `DIAGNOSTIC_USER_ID` | no | — | Extra detail for `rake commands:inspect`. |
+
+Gaia validates its configuration at startup and exits with a clear message if something is wrong, such as a missing token, an unknown timezone or a backup hour outside 0–23.
+
+## Running from source
 
 Gaia is written in **Rust** and **Ruby**:
 
@@ -10,15 +49,13 @@ Gaia is written in **Rust** and **Ruby**:
 - `ruby/` (Ruby): operations tooling — migrations, command synchronization, command diagnostics — driven by the `Rakefile`.
 - `db/migrations/*.sql` and `shared/commands.json` are shared: the Rust bot embeds them at compile time, the Ruby tools read them at run time, and both compute the same command-schema fingerprint.
 
-## Install and run
-
 1. Install Rust 1.85+ (rustup) and Ruby 3.1+ with Bundler.
 2. Run `bundle install`.
 3. Copy `.env.example` to `.env` and add `DISCORD_TOKEN`.
 4. Run `rake migrate` (the bot also migrates on startup).
 5. Use `rake dev` (`cargo run`) for development, or `rake start` (release build) for production.
 
-`DATABASE_PATH` defaults to `./data/gaia.sqlite`. SQLite is run in WAL mode with foreign keys enabled; use a persistent, backed-up disk volume in production. Gaia always bulk-overwrites its five global Guild Install/Guild-context commands, then removes legacy guild-scoped Gaia commands once per command schema fingerprint. There is no guild-registration mode. Set optional `APPLICATION_ID` as a safety check against the authenticated application ID.
+SQLite is run in WAL mode with foreign keys enabled; use a persistent, backed-up disk volume in production. Gaia always bulk-overwrites its five global Guild Install/Guild-context commands, then removes legacy guild-scoped Gaia commands once per command schema fingerprint. There is no guild-registration mode.
 
 ## Discord setup
 
@@ -55,7 +92,7 @@ Mutes accept `s`, `m`, `h`, and `d` combinations (for example `1d 4h 30m`) up to
 
 ## Backups
 
-`/admin` → **Backups** creates versioned guild-configuration snapshots in SQLite. Each source guild retains at most two snapshots; a new snapshot is written and validated before rotation removes an older one. Automatic backups are disabled by default and, when enabled, run once daily at 03:00 in `Europe/Ljubljana`; a restart after that time creates one missed daily backup rather than duplicates.
+`/admin` → **Backups** creates versioned guild-configuration snapshots in SQLite. Each source guild retains at most two snapshots; a new snapshot is written and validated before rotation removes an older one. Automatic backups are disabled by default and, when enabled, run once daily at `BACKUP_HOUR` (default 03:00) in `TIMEZONE` (default `Europe/Ljubljana`); a restart after that time creates one missed daily backup rather than duplicates.
 
 A snapshot contains supported channels/categories and their overwrites, non-managed roles, member role assignments, selected guild settings, and Gaia configuration. It intentionally does **not** contain messages, DMs, original Discord IDs, members themselves, managed/integration roles, invites, boosts, webhooks, external integrations, other bots' data, active mutes, active temporary rooms, or a byte-for-byte server image. Snapshots are schema-versioned, SHA-256 integrity checked, and capped at 25 MB.
 
@@ -65,7 +102,7 @@ Cross-guild restore requires Administrator in the destination **and** current Ad
 
 ## Embed JSON
 
-Embed payloads are message JSON, for example `{"content":"Hello","embeds":[{"title":"Welcome","description":"..."}]}`. Gaia validates JSON syntax, Discord message/embed limits, fields, and HTTP(S) URLs before saving. Names are unique per server, case-insensitively (1–64 characters, no control characters). Gaia tracks embeds it sends from this release onward; after editing, an administrator can update tracked copies in the current guild in place. Previously sent messages are intentionally not retroactively discovered.
+Embed payloads are message JSON, for example `{"content":"Hello","embeds":[{"title":"Welcome","description":"..."}]}`. Gaia validates JSON syntax, Discord message/embed limits, fields, and HTTP(S) URLs before saving. Names are unique per server, case-insensitively (1–64 characters, no control characters). Gaia tracks the embeds it sends; after editing, an administrator can update tracked copies in the current guild in place. Previously sent messages are intentionally not retroactively discovered.
 
 Attachments are uploaded from the Embed Manager. Gaia only downloads them from `https://cdn.discordapp.com` or `https://media.discordapp.net` (no redirects, 15-second timeout), stops reading past 8 MB, and checks that the bytes match the declared type (PNG, JPEG, GIF, WEBP, PDF, or UTF-8 plain text). A template holds at most 10 attachments totalling 20 MB. Embed Manager sessions and unsaved previews expire after 15 minutes, and each administrator has at most five open at a time.
 
@@ -87,6 +124,16 @@ Back up the SQLite database while the process is stopped, or use SQLite's online
 
 `Dockerfile` builds a multi-stage, non-root production image (Rust build stage, Ruby 3.4 slim runtime with the `gaia` binary and the Ruby tooling); `docker-compose.yml` runs it with a named volume for `/app/data`, a read-only root filesystem, dropped capabilities, and `no-new-privileges`. Migrations run automatically on startup (`db::create_database`), and slash commands resynchronize on ready, so no extra setup steps are required beyond providing environment variables.
 
-In Coolify: create a new resource from this repository using **Docker Compose** as the build pack (it will pick up `docker-compose.yml`), then set the required environment variables under the resource's Environment Variables tab — at minimum `DISCORD_TOKEN`; also set `APPLICATION_ID` and any of the logging variables from `.env.example` you use. Coolify injects these into the container via the `${VAR}` references in the compose file. Do not set `DATABASE_PATH` — it's fixed to `/app/data/gaia.sqlite` inside the container so it lands on the persistent volume. There is no HTTP port to expose; this is an outbound-only Discord gateway connection, so leave Coolify's domain/port configuration empty.
+In Coolify: create a new resource from this repository using **Docker Compose** as the build pack (it will pick up `docker-compose.yml`), then set the required environment variables under the resource's Environment Variables tab — at minimum `DISCORD_TOKEN`; also set `APPLICATION_ID`, `TIMEZONE`, `BACKUP_HOUR` and any of the logging variables from `.env.example` you use. Coolify injects these into the container via the `${VAR}` references in the compose file. Do not set `DATABASE_PATH` — it's fixed to `/app/data/gaia.sqlite` inside the container so it lands on the persistent volume. There is no HTTP port to expose; this is an outbound-only Discord gateway connection, so leave Coolify's domain/port configuration empty.
 
 Inside the container the tooling is available as `bundle exec rake commands:sync`, `commands:inspect` and `migrate` (e.g. `docker compose exec gaia bundle exec rake commands:inspect`).
+
+## Contributing and security
+
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md). Release notes are in [CHANGELOG.md](CHANGELOG.md).
+
+## License
+
+Gaia is released under the [MIT License](LICENSE). Copyright (c) 2026 DarkZmaj.
+
+It includes a lightly patched copy of [serenity](https://github.com/serenity-rs/serenity) in `vendor/serenity`, distributed under its own ISC license ([`vendor/serenity/LICENSE.md`](vendor/serenity/LICENSE.md)).

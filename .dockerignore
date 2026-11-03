@@ -9,3 +9,6 @@ coverage
 .gitignore
 *.md
 docs
+install.sh
+install.ps1
+.github
