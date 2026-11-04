@@ -2,6 +2,11 @@
 
 All notable changes to Gaia are documented here. Gaia follows [Semantic Versioning](https://semver.org/).
 
+## 1.0.1 — 2026-11-04
+
+- Verification honeypot: the DM now carries a single-use, one-day invite back to the server the member was kicked from, instead of one fixed link for every server. Without the Create Invite permission it tells them to contact the server's moderators. The install permission integer now includes Create Invite (`2435902483`).
+- README: restore is described as what it is, a full replacement of the destination server after a safety backup, not a merge.
+
 ## 1.0.0 — 2026-11-03
 
 First public release.

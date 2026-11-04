@@ -17,12 +17,15 @@ pub fn normalize_verification_color(input: &str) -> Option<i64> {
     (value.len() == 6 && value.bytes().all(|b| b.is_ascii_hexdigit())).then(|| i64::from_str_radix(value, 16).ok()).flatten()
 }
 
-// shortcut: one rejoin link for every guild Gaia is in; make it a per-guild setting if Gaia serves other communities.
-pub const HONEYPOT_REJOIN_URL: &str = "https://discord.gg/rrtgDYd6a8";
-
-pub fn honeypot_dm(guild_name: &str) -> String {
+/// The DM for a member caught by the honeypot. `invite` is a single-use link back to the
+/// same server; without one (no Create Invite permission) the member is pointed at its staff.
+pub fn honeypot_dm(guild_name: &str, invite: Option<&str>) -> String {
+    let back = match invite {
+        Some(url) => format!("If this was a mistake, you can rejoin here: {url}"),
+        None => "If this was a mistake, contact the server's moderators to get back in.".to_string(),
+    };
     format!(
-        "You were kicked from **{guild_name}** because you sent a message in the verification channel. That channel is a trap for spam bots.\n\nIf this was a mistake, you can rejoin here: {HONEYPOT_REJOIN_URL}"
+        "You were kicked from **{guild_name}** because you sent a message in the verification channel. That channel is a trap for spam bots.\n\n{back}"
     )
 }
 
@@ -159,11 +162,28 @@ impl VerificationService {
             });
             return Ok(());
         }
+        // A one-use, one-day invite to this server's verification channel, so a mistaken human can come back.
+        let invite = message
+            .channel_id
+            .create_invite(
+                http,
+                serenity::builder::CreateInvite::new()
+                    .max_age(86_400)
+                    .max_uses(1)
+                    .unique(true)
+                    .audit_log_reason("Gaia honeypot: rejoin link for the kicked member"),
+            )
+            .await
+            .ok()
+            .map(|i| i.url());
         // DM before the kick: once the member shares no server with Gaia, Discord refuses the DM.
         let dm_sent = member
             .user
             .id
-            .direct_message(http, serenity::builder::CreateMessage::new().content(honeypot_dm(&guild_name)))
+            .direct_message(
+                http,
+                serenity::builder::CreateMessage::new().content(honeypot_dm(&guild_name, invite.as_deref())),
+            )
             .await
             .is_ok();
         match guild.kick_with_reason(http, member.user.id, "Gaia honeypot: sent a message in the verification channel").await {
@@ -471,10 +491,10 @@ mod tests {
     #[tokio::test]
     async fn honeypot_dm_names_the_guild_and_rejoin_link_and_kicks_once_per_burst() {
         let (_, service, _) = setup();
-        let dm = honeypot_dm("DarkDragon");
-        assert!(dm.contains("**DarkDragon**"));
-        assert!(dm.contains(HONEYPOT_REJOIN_URL));
-        assert_eq!(HONEYPOT_REJOIN_URL, "https://discord.gg/rrtgDYd6a8");
+        let dm = honeypot_dm("DarkDragon", Some("https://discord.gg/abc123"));
+        assert!(dm.contains("**DarkDragon**") && dm.contains("https://discord.gg/abc123"));
+        let dm = honeypot_dm("DarkDragon", None);
+        assert!(dm.contains("contact the server's moderators") && !dm.contains("discord.gg"));
         let claims: Vec<bool> = (0..3).map(|_| service.claim_honeypot_kick("g:spammer".into())).collect();
         assert_eq!(claims, [true, false, false]);
     }
@@ -569,19 +589,32 @@ mod tests {
     #[tokio::test]
     async fn honeypot_deletes_the_message_dms_the_rejoin_link_then_kicks() {
         let (h, service) = live().await;
+        h.on(
+            "POST",
+            "/channels/300/invites",
+            200,
+            json!({
+                "code": "back123", "created_at": "2026-11-04T12:00:00.000000+00:00",
+                "channel": {"id": "300", "name": "verify", "type": 0},
+                "max_age": 86400, "max_uses": 1, "temporary": false, "uses": 0
+            }),
+        );
         let message = h.message(1, VERIFY, SPAMMER, "buy cheap nitro");
         service.honeypot(&message).await.unwrap();
+        let invite = h.calls_to("POST", "/channels/300/invites");
+        assert_eq!((invite[0].body["max_uses"].as_u64(), invite[0].body["max_age"].as_u64()), (Some(1), Some(86400)));
         let dm_channel = h.calls_to("POST", "/users/@me/channels");
         assert_eq!(dm_channel[0].body["recipient_id"], "5");
         let trace = h.trace();
-        assert_eq!(trace.len(), 4);
+        assert_eq!(trace.len(), 5);
         assert_eq!(trace[0], format!("DELETE /channels/300/messages/{}", message.id));
-        assert_eq!(trace[1], "POST /users/@me/channels");
-        assert!(trace[2].starts_with("POST /channels/") && trace[2].ends_with("/messages"));
-        assert_eq!(trace[3], "DELETE /guilds/1/members/5");
+        assert_eq!(trace[1], "POST /channels/300/invites");
+        assert_eq!(trace[2], "POST /users/@me/channels");
+        assert!(trace[3].starts_with("POST /channels/") && trace[3].ends_with("/messages"));
+        assert_eq!(trace[4], "DELETE /guilds/1/members/5");
         let dm = h.dms()[0]["content"].as_str().unwrap().to_string();
-        assert!(dm.contains("**DarkDragon**") && dm.contains(HONEYPOT_REJOIN_URL));
-        assert_eq!(h.calls()[3].reason.as_deref(), Some("Gaia honeypot: sent a message in the verification channel"));
+        assert!(dm.contains("**DarkDragon**") && dm.contains("https://discord.gg/back123"), "{dm}");
+        assert_eq!(h.calls()[4].reason.as_deref(), Some("Gaia honeypot: sent a message in the verification channel"));
         let audits = h.audits().await;
         assert_eq!(audits[0]["title"], "Honeypot Kick");
         assert_eq!(field(&audits[0], "DM Sent").as_deref(), Some("true"));

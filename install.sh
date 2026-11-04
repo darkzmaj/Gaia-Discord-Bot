@@ -6,7 +6,7 @@ set -euo pipefail
 
 REPO_URL="https://github.com/darkzmaj/Gaia-Discord-Bot.git"
 DIR="${GAIA_DIR:-$HOME/gaia-discord-bot}"
-PERMISSIONS=2435902482
+PERMISSIONS=2435902483
 
 say() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }

@@ -4,7 +4,7 @@
 $ErrorActionPreference = 'Stop'
 $RepoUrl = 'https://github.com/darkzmaj/Gaia-Discord-Bot.git'
 $Dir = if ($env:GAIA_DIR) { $env:GAIA_DIR } else { Join-Path $HOME 'gaia-discord-bot' }
-$Permissions = 2435902482
+$Permissions = 2435902483
 
 function Say($m) { Write-Host "==> $m" -ForegroundColor Green }
 function Die($m) { Write-Host "error: $m" -ForegroundColor Red; exit 1 }
