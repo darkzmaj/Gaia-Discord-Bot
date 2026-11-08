@@ -22,9 +22,12 @@ services:
       MEMBER_LOG_CHANNEL: ${MEMBER_LOG_CHANNEL:-}
       LOG_WEBHOOK_URL: ${LOG_WEBHOOK_URL:-}
       MEMBER_LOG_WEBHOOK_URL: ${MEMBER_LOG_WEBHOOK_URL:-}
+      # Optional health check for uptime monitors, for example 0.0.0.0:8080 (see .env.example).
+      GAIA_HEALTH_ADDR: ${GAIA_HEALTH_ADDR:-}
     volumes:
       - gaia-data:/app/data
-    # No inbound ports: this is an outbound-only Discord gateway connection.
+    # No published ports. With GAIA_HEALTH_ADDR set, a reverse proxy can reach the
+    # health check on the internal network; nothing else listens.
     # No meaningful process-external healthcheck exists for a gateway-only bot;
     # `restart: unless-stopped` recovers from crashes via the container exiting.
     # Security hardening
