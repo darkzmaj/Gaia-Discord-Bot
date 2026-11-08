@@ -1,5 +1,5 @@
 //! Optional health check for uptime monitors. Off unless GAIA_HEALTH_ADDR is
-//! set (for example 0.0.0.0:8080). `GET /health` answers `ok` (200) only while
+//! set (for example 0.0.0.0:8080). `GET /health` (or `/`) answers `ok` (200) only while
 //! the Discord gateway connection is up, `disconnected` (503) otherwise. It
 //! reveals nothing else: no guild names, counts or versions.
 
@@ -22,8 +22,9 @@ fn respond(request_line: &str) -> String {
     let (method, path) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
     let path = path.split('?').next().unwrap_or("");
     let (status, body) = match (method, path) {
-        ("GET" | "HEAD", "/health") if CONNECTED.load(Ordering::SeqCst) => ("200 OK", "ok"),
-        ("GET" | "HEAD", "/health") => ("503 Service Unavailable", "disconnected"),
+        // "/" too: a reverse proxy may strip its path prefix (kori.my/gaia-health → /).
+        ("GET" | "HEAD", "/health" | "/") if CONNECTED.load(Ordering::SeqCst) => ("200 OK", "ok"),
+        ("GET" | "HEAD", "/health" | "/") => ("503 Service Unavailable", "disconnected"),
         _ => ("404 Not Found", "not found"),
     };
     let body = if method == "HEAD" { "" } else { body };
@@ -63,7 +64,8 @@ mod tests {
         let ok = respond("GET /health?x=1 HTTP/1.1");
         assert!(ok.starts_with("HTTP/1.1 200") && ok.ends_with("\r\n\r\nok"));
         assert!(respond("HEAD /health HTTP/1.1").ends_with("\r\n\r\n"));
-        assert!(respond("GET / HTTP/1.1").starts_with("HTTP/1.1 404"));
+        assert!(respond("GET / HTTP/1.1").starts_with("HTTP/1.1 200"));
+        assert!(respond("GET /admin HTTP/1.1").starts_with("HTTP/1.1 404"));
         assert!(respond("POST /health HTTP/1.1").starts_with("HTTP/1.1 404"));
         assert!(respond("").starts_with("HTTP/1.1 404"));
         set_connected(false);
