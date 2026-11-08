@@ -1937,7 +1937,12 @@ impl Handler {
 
 #[async_trait]
 impl EventHandler for Handler {
+    async fn shard_stage_update(&self, _ctx: Context, event: serenity::all::ShardStageUpdateEvent) {
+        crate::health::set_connected(event.new == serenity::all::ConnectionStage::Connected);
+    }
+
     async fn ready(&self, ctx: Context, _ready: Ready) {
+        crate::health::set_connected(true);
         let Some(bot) = self.bot() else { return };
         if bot.ready_once.swap(true, Ordering::SeqCst) {
             return;

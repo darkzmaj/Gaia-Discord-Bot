@@ -5,6 +5,7 @@ mod bot;
 mod config;
 mod db;
 mod discord;
+mod health;
 mod logger;
 mod services;
 #[cfg(test)]
@@ -45,6 +46,14 @@ async fn run(config: config::Config) -> anyhow::Result<()> {
     let discord = discord::Discord { http: client.http.clone(), cache: client.cache.clone() };
     let bot = Arc::new(GaiaBot::new(repo, config.application_id.clone(), &config, discord));
     let _ = slot.set(bot.clone());
+    if let Some(addr) = std::env::var("GAIA_HEALTH_ADDR").ok().filter(|v| !v.trim().is_empty()) {
+        let addr: std::net::SocketAddr = addr.trim().parse()?;
+        tokio::spawn(async move {
+            if let Err(error) = health::serve(addr).await {
+                logger::error("Health check could not start", ctx! {"error" => error.to_string()});
+            }
+        });
+    }
     let shards = client.shard_manager.clone();
     let mut gateway = tokio::spawn(async move { client.start().await });
 
