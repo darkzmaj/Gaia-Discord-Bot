@@ -104,11 +104,9 @@ mod tests {
             token: "MTIzNDU2Nzg5MDEyMzQ1Njc4OTA.GhIjKl.abcdefghijklmnopqrstuvwxyz12".into(),
             database_path: "./data/gaia.sqlite".into(),
             application_id: Some("1".into()),
-            audit_logging: crate::config::AuditLogging { webhook_url: Some("https://x/api/webhooks/1/secret-hook".into()), ..Default::default() },
-            member_logging: crate::config::MemberLogging { webhook_url: Some("https://x/api/webhooks/2/secret-hook".into()), ..Default::default() },
         };
         let printed = format!("{config:?}");
-        assert!(!printed.contains("GhIjKl") && !printed.contains("secret-hook"), "{printed}");
+        assert!(!printed.contains("GhIjKl"), "{printed}");
         assert!(printed.contains("./data/gaia.sqlite"));
     }
 }

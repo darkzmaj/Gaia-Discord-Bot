@@ -17,11 +17,6 @@ services:
       BACKUP_HOUR: ${BACKUP_HOUR:-}
       DIAGNOSTIC_GUILD_ID: ${DIAGNOSTIC_GUILD_ID:-}
       DIAGNOSTIC_USER_ID: ${DIAGNOSTIC_USER_ID:-}
-      LOG_GUILD: ${LOG_GUILD:-}
-      LOG_GUILD_CHANNEL: ${LOG_GUILD_CHANNEL:-}
-      MEMBER_LOG_CHANNEL: ${MEMBER_LOG_CHANNEL:-}
-      LOG_WEBHOOK_URL: ${LOG_WEBHOOK_URL:-}
-      MEMBER_LOG_WEBHOOK_URL: ${MEMBER_LOG_WEBHOOK_URL:-}
       # Optional health check for uptime monitors, for example 0.0.0.0:8080 (see .env.example).
       GAIA_HEALTH_ADDR: ${GAIA_HEALTH_ADDR:-}
     volumes:

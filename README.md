@@ -35,11 +35,25 @@ Almost everything (AutoRole, verification, voice rooms, staff, moderation, backu
 | `TIMEZONE` | no | `Europe/Ljubljana` | IANA timezone for scheduled embeds, daily backups and shown dates (e.g. `UTC`, `America/New_York`). |
 | `BACKUP_HOUR` | no | `3` | Local hour (0–23) the daily automatic backup runs, when enabled in `/admin`. |
 | `DATABASE_PATH` | no | `./data/gaia.sqlite` | SQLite file (fixed to `/app/data/gaia.sqlite` in Docker). |
-| `LOG_WEBHOOK_URL`, `LOG_GUILD`, `LOG_GUILD_CHANNEL` | no | — | Operator-wide staff/audit log destination. |
-| `MEMBER_LOG_WEBHOOK_URL`, `MEMBER_LOG_CHANNEL` | no | — | Operator-wide join/leave log destination. |
 | `DIAGNOSTIC_GUILD_ID`, `DIAGNOSTIC_USER_ID` | no | — | Extra detail for `rake commands:inspect`. |
 
-Gaia validates its configuration at startup and exits with a clear message if something is wrong, such as a missing token, an unknown timezone or a backup hour outside 0–23.
+Gaia validates its configuration at startup and exits with a clear message if something is wrong, such as a missing token, an unknown timezone or a backup hour outside 0–23. There are no log settings here: log channels are chosen in Discord.
+
+## Logs
+
+Gaia logs into Discord channels you pick from menus; there are no webhooks to create. The first time `/admin` runs in a server, it asks how Gaia should log, and only the server owner can answer. Every server Gaia joins goes through this once:
+
+- **🌐 Global:** logs from every server in global mode go to one **log server**, and each log shows which server it came from. Bot health (started, shutting down, startup failed, joined or left a server) goes there too. The first server to choose Global becomes the log server; its owner sets the default channels and can give any server its own channels there with **Server Channels**. Another server in global mode can take over as log server with **Make This the Log Server**, but moving it away from an existing log server takes that server's owner. Choose this when Gaia is your own bot.
+- **🏠 Per server:** the server's logs stay in that server, in channels it picks itself. Nothing is shared.
+
+If the Discord application is public (**Public Bot** is on in the Developer Portal, so anyone can invite it), Global is not offered and every server is per server: everyone who adds it effectively has their own bot. Gaia reads that switch when it starts.
+
+Each mode has two channels:
+
+- **Activity log:** moderation, verification, backups, embeds, role changes and every `/admin` configuration change.
+- **Member log:** members joining and leaving (bots are skipped).
+
+Gaia saves a channel only after it has posted a confirmation there, so a channel it cannot write to is refused straight away. Keep these channels private to staff. The owner can change the mode at any time in `/admin` → **Logs** → **Change Mode**. This is the same setup as Kori's `/ticket`.
 
 ## Running from source
 
@@ -72,7 +86,7 @@ Administrators are checked at runtime against Discord's actual Administrator per
 | `/embed` (interactive per-server embed manager) | Administrator |
 | `/unverify` | Administrator |
 
-`/admin` has no options: it opens an ephemeral dashboard with AutoRole, Voice Rooms, Staff, and Moderation sections. Each section uses native Discord role, user, and channel pickers, and changes persist immediately. `/embed` likewise opens an ephemeral manager for creating, editing, sending, listing, and viewing this server's templates.
+`/admin` has no options: the first time it opens on **Logging Setup** (see [Logs](#logs)), then on an ephemeral dashboard with AutoRole, Voice Rooms, Staff, Moderation, Verification, Backups, Remove/Add Roles and Logs sections. Each section uses native Discord role, user, and channel pickers, and changes persist immediately. `/embed` likewise opens an ephemeral manager for creating, editing, sending, listing, and viewing this server's templates.
 
 ## Storage model
 

@@ -44,7 +44,7 @@ async fn run(config: config::Config) -> anyhow::Result<()> {
         .event_handler(Handler { bot: slot.clone() })
         .await?;
     let discord = discord::Discord { http: client.http.clone(), cache: client.cache.clone() };
-    let bot = Arc::new(GaiaBot::new(repo, config.application_id.clone(), &config, discord));
+    let bot = Arc::new(GaiaBot::new(repo, config.application_id.clone(), discord));
     let _ = slot.set(bot.clone());
     if let Some(addr) = std::env::var("GAIA_HEALTH_ADDR").ok().filter(|v| !v.trim().is_empty()) {
         let addr: std::net::SocketAddr = addr.trim().parse()?;
@@ -94,7 +94,7 @@ async fn run(config: config::Config) -> anyhow::Result<()> {
         bot.embed_scheduler.stop();
     }
     let flush = std::time::Duration::from_millis(2_000);
-    tokio::join!(bot.audit.shutdown(flush), bot.member_log.shutdown(flush));
+    bot.audit.shutdown(flush).await;
     shards.shutdown_all().await;
     // The SQLite connection closes with the process; WAL keeps it crash-safe.
     std::process::exit(exit_code);

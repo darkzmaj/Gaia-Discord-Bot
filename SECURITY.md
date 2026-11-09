@@ -14,7 +14,7 @@ otherwise.
 
 ## Operator checklist
 
-- Keep `DISCORD_TOKEN` and webhook URLs out of git. `.env` is ignored; the installer creates it with
+- Keep `DISCORD_TOKEN` out of git. `.env` is ignored; the installer creates it with
   owner-only permissions. If a token leaks, reset it in the Discord Developer Portal immediately.
 - Grant Gaia only the permissions listed in the README. It never needs Administrator.
 - Keep Gaia's role below roles it should not manage; Discord's role hierarchy is enforced.

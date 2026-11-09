@@ -8,6 +8,7 @@ pub mod embed_renderer;
 pub mod embed_scheduler;
 pub mod embed_validation;
 pub mod locks;
+pub mod log_routing;
 pub mod member_log_service;
 pub mod mute_service;
 pub mod schedule_time;

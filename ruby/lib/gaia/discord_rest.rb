@@ -46,7 +46,7 @@ module Gaia
       uri = URI("#{BASE}#{path}")
       req = klass.new(uri)
       req['Authorization'] = "Bot #{@token}"
-      req['User-Agent'] = 'DiscordBot (https://github.com/darkzmaj/Gaia-Discord-Bot, 1.0.1) Gaia'
+      req['User-Agent'] = 'DiscordBot (https://github.com/darkzmaj/Gaia-Discord-Bot, 2.0.0) Gaia'
       if body
         req['Content-Type'] = 'application/json'
         req.body = JSON.generate(body)

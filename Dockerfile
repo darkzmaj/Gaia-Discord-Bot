@@ -16,7 +16,7 @@ RUN cargo build --release --locked
 # Runtime: the Rust binary plus the Ruby operations tooling (migrate, commands:*)
 ######################################################################################
 FROM ruby:3.4-slim-bookworm AS runtime
-LABEL org.opencontainers.image.title="Gaia"       org.opencontainers.image.description="Multi-server Discord moderation and utility bot"       org.opencontainers.image.source="https://github.com/darkzmaj/Gaia-Discord-Bot"       org.opencontainers.image.licenses="MIT"       org.opencontainers.image.authors="DarkZmaj"       org.opencontainers.image.version="1.0.1"
+LABEL org.opencontainers.image.title="Gaia"       org.opencontainers.image.description="Multi-server Discord moderation and utility bot"       org.opencontainers.image.source="https://github.com/darkzmaj/Gaia-Discord-Bot"       org.opencontainers.image.licenses="MIT"       org.opencontainers.image.authors="DarkZmaj"       org.opencontainers.image.version="2.0.0"
 WORKDIR /app
 ENV BUNDLE_WITHOUT=test BUNDLE_DEPLOYMENT=1 BUNDLE_USER_HOME=/tmp/.bundle
 

@@ -14,10 +14,9 @@
 //! [`Harness::on`] win over the defaults (latest rule first). Member GET/PUT-role/DELETE-role/kick
 //! routes are stateful against the seeded members, like real REST; nothing updates the cache,
 //! because Discord does that through gateway events, which do not exist here.
-use crate::config::AuditLogging;
 use crate::db::repositories::GaiaRepository;
 use crate::discord::Discord;
-use crate::services::audit_log_service::{AuditLogService, WebhookResponse};
+use crate::services::audit_log_service::AuditLogService;
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::response::Response;
@@ -293,7 +292,6 @@ pub struct Harness {
     pub repo: Arc<GaiaRepository>,
     /// Audit log whose webhook deliveries are captured; read them with [`Harness::audits`].
     pub audit: Arc<AuditLogService>,
-    audits: Arc<Mutex<Vec<Value>>>,
 }
 
 pub fn repo() -> Arc<GaiaRepository> {
@@ -323,32 +321,15 @@ impl Harness {
         });
         cache.update(&mut serde_json::from_value::<ReadyEvent>(json!(ready)).unwrap());
 
-        let audits = Arc::new(Mutex::new(Vec::new()));
-        let sink = audits.clone();
-        let transport: crate::services::audit_log_service::WebhookTransport = Arc::new(move |_url, body: Option<String>| {
-            let sink = sink.clone();
-            Box::pin(async move {
-                let body = match body {
-                    None => json!({"guild_id": AUDIT_GUILD, "channel_id": AUDIT_CHANNEL}).to_string(),
-                    Some(payload) => {
-                        let payload: Value = serde_json::from_str(&payload)?;
-                        sink.lock().unwrap().push(payload["embeds"][0].clone());
-                        String::new()
-                    }
-                };
-                Ok(WebhookResponse { status: 200, retry_after: None, body: body.into_bytes() })
-            })
-        });
-        let config = AuditLogging {
-            webhook_url: Some(format!("https://discord.com/api/webhooks/{AUDIT_GUILD}/test-token")),
-            guild_id: Some(AUDIT_GUILD.into()),
-            channel_id: Some(AUDIT_CHANNEL.into()),
-        };
-        let audit = Arc::new(AuditLogService::with_transport(config, transport));
-        audit.initialize().await;
-        assert!(audit.enabled(), "capturing audit log failed to start");
+        // Audit events reach a fake log server: every seeded server is in global mode (see `seed`).
+        let repo = repo();
+        repo.set_log_hub(Some(AUDIT_GUILD)).unwrap();
+        repo.update_setting(AUDIT_GUILD, "log_channel_id", rusqlite::types::Value::Text(AUDIT_CHANNEL.into())).unwrap();
+        let http = Arc::new(http);
+        let audit = Arc::new(AuditLogService::new(Arc::new(crate::services::log_routing::LogRouter::new(repo.clone())), http.clone()));
+        audit.router().set_public(false);
 
-        Self { fake, discord: Discord { http: Arc::new(http), cache }, repo: repo(), audit, audits }
+        Self { fake, discord: Discord { http, cache }, repo, audit }
     }
 
     /// Applies the guild to the cache (as GUILD_CREATE) and registers its members with the fake REST API.
@@ -363,8 +344,10 @@ impl Harness {
                 fake.channel_guilds.insert(channel["id"].as_str().unwrap().to_string(), id.clone());
             }
         }
+        let id = guild.id().to_string();
         let mut event: GuildCreateEvent = serde_json::from_value(guild.json).expect("invalid guild seed");
         self.discord.cache.update(&mut event);
+        self.repo.update_setting(&id, "log_mode", rusqlite::types::Value::Text("global".into())).unwrap();
     }
 
     /// Overrides the response for `method` + `pattern` (`*` = one path segment), e.g.
@@ -373,8 +356,10 @@ impl Harness {
         self.fake.lock().unwrap().rules.push(Rule { method: method.into(), pattern: pattern.into(), status, body });
     }
 
+    /// Every call except audit deliveries to the fake log server (read those with [`Harness::audits`]).
     pub fn calls(&self) -> Vec<Call> {
-        self.fake.lock().unwrap().calls.clone()
+        let audit = format!("/channels/{AUDIT_CHANNEL}/messages");
+        self.fake.lock().unwrap().calls.iter().filter(|c| c.path != audit).cloned().collect()
     }
 
     pub fn calls_to(&self, method: &str, pattern: &str) -> Vec<Call> {
@@ -405,7 +390,8 @@ impl Harness {
     /// Embeds delivered to the audit log so far (waits for the delivery worker).
     pub async fn audits(&self) -> Vec<Value> {
         self.audit.idle().await;
-        self.audits.lock().unwrap().clone()
+        let path = format!("/channels/{AUDIT_CHANNEL}/messages");
+        self.fake.lock().unwrap().calls.iter().filter(|c| c.method == "POST" && c.path == path).map(|c| c.body["embeds"][0].clone()).collect()
     }
 
     pub fn member(&self, guild: u64, user: u64) -> serenity::all::Member {
@@ -425,15 +411,11 @@ impl Harness {
 
     /// The full bot over the harness's Discord and repository, for driving `on_interaction(&h.ctx(), ..)`.
     /// Its own audit log is unconfigured; services built by hand can use [`Harness::audit`] instead.
+    /// A bot whose Discord application is private (global logging allowed), as `on_ready` would find it.
     pub fn bot(&self) -> crate::bot::GaiaBot {
-        let config = crate::config::Config {
-            token: String::new(),
-            database_path: String::new(),
-            application_id: Some(APP_ID.to_string()),
-            audit_logging: Default::default(),
-            member_logging: Default::default(),
-        };
-        crate::bot::GaiaBot::new(self.repo.clone(), config.application_id.clone(), &config, self.discord.clone())
+        let bot = crate::bot::GaiaBot::new(self.repo.clone(), Some(APP_ID.to_string()), self.discord.clone());
+        bot.audit.router().set_public(false);
+        bot
     }
 
     fn next_id(&self) -> String {

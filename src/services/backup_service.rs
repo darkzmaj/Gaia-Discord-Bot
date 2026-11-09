@@ -1094,10 +1094,14 @@ impl BackupService {
                 title: "Backup Accessed By Creator Fallback".into(),
                 category: "Backups".into(),
                 color: "warning".into(),
-                guild: Some(AuditSubject::named(backup.source_guild_id.clone(), backup.source_guild_name.clone())),
+                // Gaia has left the source server, so it has no log channel any more: this goes to the log server.
+                guild: None,
                 actor: Some(AuditSubject::id(user_id)),
                 reason: Some("Gaia is no longer in the source guild, so Administrator access could not be checked.".into()),
-                details: vec![("Backup".into(), json!(backup.backup_id))],
+                details: vec![
+                    ("Backup".into(), json!(backup.backup_id)),
+                    ("Source Server".into(), json!(format!("{} ({})", backup.source_guild_name, backup.source_guild_id))),
+                ],
                 ..Default::default()
             });
         }

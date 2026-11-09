@@ -1,5 +1,4 @@
 //! Gaia bot: gateway event wiring, interaction dispatch, moderation commands and the per-server Embed Manager UI.
-use crate::config::Config;
 use crate::ctx;
 use crate::db::repositories::{GaiaRepository, ScheduledEmbedSend};
 use crate::discord::Discord;
@@ -17,6 +16,7 @@ use crate::services::embed_renderer::{with_default_color,
 };
 use crate::services::embed_scheduler::EmbedScheduler;
 use crate::services::embed_validation::validate_embed_payload;
+use crate::services::log_routing::LogRouter;
 use crate::services::member_log_service::MemberLogService;
 use crate::services::mute_service::MuteService;
 use crate::services::schedule_time::parse_schedule;
@@ -494,9 +494,9 @@ fn details(pairs: &[(&str, String)]) -> Vec<(String, Value)> {
 }
 
 impl GaiaBot {
-    pub fn new(repo: Arc<GaiaRepository>, application_id: Option<String>, config: &Config, discord: Discord) -> Self {
-        let audit = Arc::new(AuditLogService::new(config.audit_logging.clone(), reqwest::Client::new()));
-        let member_log = Arc::new(MemberLogService::new(config.member_logging.clone(), reqwest::Client::new()));
+    pub fn new(repo: Arc<GaiaRepository>, application_id: Option<String>, discord: Discord) -> Self {
+        let audit = Arc::new(AuditLogService::new(Arc::new(LogRouter::new(repo.clone())), discord.http.clone()));
+        let member_log = Arc::new(MemberLogService::new(audit.clone()));
         let mutes = Arc::new(MuteService::new(repo.clone(), discord.clone(), Some(audit.clone())));
         let rooms = Arc::new(VoiceRoomService::new(repo.clone(), discord.clone()));
         let verification = Arc::new(VerificationService::new(repo.clone(), discord.clone(), Some(audit.clone())));
@@ -512,7 +512,7 @@ impl GaiaBot {
             verification.clone(),
             backups.clone(),
             move || compact_uptime(uptime_start.lock().unwrap().elapsed().as_millis()),
-            Some(audit.clone()),
+            audit.clone(),
         ));
         Self {
             discord,
@@ -606,15 +606,15 @@ impl GaiaBot {
             "Gaia started",
             ctx! {"version" => env!("CARGO_PKG_VERSION"), "guilds" => guilds.len(), "timezone" => crate::config::timezone().name(), "userId" => self.bot_id().to_string(), "applicationId" => self.discord.http.application_id().map(|a| a.to_string())},
         );
+        // A public bot is always per server. If Discord cannot say, stay per server until the next start.
+        match self.discord.http.get_current_application_info().await {
+            Ok(app) => self.audit.router().set_public(app.bot_public),
+            Err(error) => logger::warn("could not read the application's Public Bot setting; global logging stays off", ctx! {"error" => error.to_string()}),
+        }
         self.audit.record(AuditEvent {
             details: vec![("Guilds".into(), json!(guilds.len())), ("Version".into(), json!(env!("CARGO_PKG_VERSION")))],
             ..audit_event("Gaia Started", "Bot", "success")
         });
-        // Webhook destination validation is observability-only and never affects startup.
-        let audit = self.audit.clone();
-        tokio::spawn(async move { audit.initialize().await });
-        let member_log = self.member_log.clone();
-        tokio::spawn(async move { member_log.initialize().await });
         self.command_sync.synchronize(&self.discord, false).await?;
         self.mutes.start();
         self.repo.interrupt_running_restores()?;
@@ -750,6 +750,7 @@ impl GaiaBot {
                 },
             )?;
         }
+        self.repo.forget_log_channel(&channel)?;
         self.repo.delete_room(&guild, &channel)?;
         self.repo.remove_mute_restores_for_channel(&guild, &channel)?;
         self.repo.remove_sent_embeds_in_channel(&guild, &channel)?;
