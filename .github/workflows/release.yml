@@ -59,3 +59,20 @@ jobs:
             tags="$tags -t $IMAGE:$v -t $IMAGE:${v%.*} -t $IMAGE:${v%%.*}"
           fi
           docker buildx imagetools create $tags "$IMAGE:${GITHUB_SHA}-amd64" "$IMAGE:${GITHUB_SHA}-arm64"
+
+  # Redeploys on Coolify once the new :latest exists (the app's build command is `docker compose pull`).
+  # Skipped unless the repo has the COOLIFY_WEBHOOK (the app's deploy URL) and COOLIFY_TOKEN secrets.
+  deploy:
+    needs: manifest
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy on Coolify
+        env:
+          COOLIFY_WEBHOOK: ${{ secrets.COOLIFY_WEBHOOK }}
+          COOLIFY_TOKEN: ${{ secrets.COOLIFY_TOKEN }}
+        run: |
+          if [ -z "$COOLIFY_WEBHOOK" ] || [ -z "$COOLIFY_TOKEN" ]; then
+            echo "::notice::COOLIFY_WEBHOOK or COOLIFY_TOKEN not set; skipping deploy"
+            exit 0
+          fi
+          curl -fsS --retry 3 -H "Authorization: Bearer $COOLIFY_TOKEN" "$COOLIFY_WEBHOOK"
