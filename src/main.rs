@@ -10,6 +10,8 @@ mod logger;
 mod services;
 #[cfg(test)]
 mod test_support;
+#[cfg(test)]
+mod stress;
 
 use bot::{GaiaBot, Handler};
 use db::repositories::GaiaRepository;
